@@ -658,18 +658,106 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     return defs;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local uint64_t g_pxc_test_import_scan_steps;
+
+void cbm_pxc_test_import_scan_reset(void) {
+    g_pxc_test_import_scan_steps = 0;
+}
+
+uint64_t cbm_pxc_test_import_scan_steps(void) {
+    return g_pxc_test_import_scan_steps;
+}
+
+static void pxc_test_note_import_scan(void) {
+    g_pxc_test_import_scan_steps++;
+}
+#else
+static void pxc_test_note_import_scan(void) {}
+#endif
+
+/* The import metadata of one file by local name: for each name, what the scan
+ * in pxc_unique_import_path answers. Built once per import map, so the map
+ * costs O(imports) rather than one scan of every import per name (1.4 s in
+ * those scans for one `from m import (a0, ..., a15999)`). */
+typedef struct {
+    const char *path; /* the last bound module_path; NULL when ambiguous */
+    bool ambiguous;
+} pxc_import_path_row_t;
+
+typedef struct {
+    CBMHashTable *by_local; /* local_name -> pxc_import_path_row_t */
+    pxc_import_path_row_t *rows;
+} pxc_import_index_t;
+
+static void pxc_import_index_free(pxc_import_index_t *index) {
+    cbm_ht_free(index->by_local);
+    cbm_free(CBM_MEM_CLASS_OTHER, index->rows);
+    index->by_local = NULL;
+    index->rows = NULL;
+}
+
+/* On allocation failure the index stays empty and lookups scan instead. */
+static void pxc_import_index_build(pxc_import_index_t *index, const CBMFileResult *result) {
+    index->by_local = NULL;
+    index->rows = NULL;
+    if (!result || result->imports.count <= 0) {
+        return;
+    }
+    index->by_local = cbm_ht_create((uint32_t)result->imports.count);
+    index->rows = (pxc_import_path_row_t *)cbm_calloc(
+        CBM_MEM_CLASS_OTHER, (size_t)result->imports.count * sizeof(pxc_import_path_row_t));
+    if (!index->by_local || !index->rows) {
+        pxc_import_index_free(index);
+        return;
+    }
+    int used = 0;
+    for (int i = 0; i < result->imports.count; i++) {
+        const char *local = result->imports.items[i].local_name;
+        const char *path = result->imports.items[i].module_path;
+        if (!local || !path) {
+            continue;
+        }
+        pxc_import_path_row_t *row = cbm_ht_get(index->by_local, local);
+        if (!row) {
+            row = &index->rows[used++];
+            cbm_ht_set(index->by_local, local, row);
+            if (cbm_ht_get(index->by_local, local) != row) {
+                pxc_import_index_free(index);
+                return;
+            }
+        } else if (row->ambiguous || strcmp(row->path, path) != 0) {
+            row->ambiguous = true;
+            row->path = NULL;
+            continue;
+        }
+        row->path = path;
+    }
+}
+
 /* Return the one source import path bound to `local_name`, or NULL when the
  * extraction metadata is absent or two distinct imports bind the same local.
  * The latter is deliberately fail-closed: choosing either path would turn an
- * ambiguous Python value into a fabricated CALL_REFERENCE. */
-static const char *pxc_unique_import_path(const CBMFileResult *result, const char *local_name,
+ * ambiguous Python value into a fabricated CALL_REFERENCE. `index` (optional)
+ * answers the same from pxc_import_index_build. */
+static const char *pxc_unique_import_path(const CBMFileResult *result,
+                                          const pxc_import_index_t *index, const char *local_name,
                                           bool *out_ambiguous) {
     if (out_ambiguous)
         *out_ambiguous = false;
     if (!result || !local_name)
         return NULL;
+    if (index && index->by_local) {
+        pxc_test_note_import_scan();
+        const pxc_import_path_row_t *row = cbm_ht_get(index->by_local, local_name);
+        if (row && row->ambiguous && out_ambiguous) {
+            *out_ambiguous = true;
+        }
+        return row ? row->path : NULL;
+    }
     const char *path = NULL;
     for (int i = 0; i < result->imports.count; i++) {
+        pxc_test_note_import_scan();
         const CBMImport *imp = &result->imports.items[i];
         if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, local_name) != 0) {
             continue;
@@ -695,9 +783,11 @@ static const char *pxc_import_leaf(const char *path) {
     return leaf;
 }
 
-static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const char *local_name) {
+static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result,
+                                             const pxc_import_index_t *index,
+                                             const char *local_name) {
     bool ambiguous = false;
-    const char *path = pxc_unique_import_path(result, local_name, &ambiguous);
+    const char *path = pxc_unique_import_path(result, index, local_name, &ambiguous);
     const char *leaf = pxc_import_leaf(path);
     if (ambiguous || !path || !path[0] || path[0] == '.' || !leaf ||
         strcmp(leaf, local_name) != 0) {
@@ -717,16 +807,17 @@ static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const 
  * non-aliased path. The shared Python registry must still materialize the
  * resulting exact QN before it earns CALL_REFERENCE. */
 static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
-                                 const char *local_name, const cbm_gbuf_node_t *target) {
+                                 const pxc_import_index_t *index, const char *local_name,
+                                 const cbm_gbuf_node_t *target) {
     if (!target || !target->qualified_name)
         return NULL;
     if (lang == CBM_LANG_KOTLIN)
-        return pxc_kotlin_import_from_metadata(result, local_name);
+        return pxc_kotlin_import_from_metadata(result, index, local_name);
     if (lang != CBM_LANG_PYTHON)
         return strdup(target->qualified_name);
 
     bool ambiguous = false;
-    const char *path = pxc_unique_import_path(result, local_name, &ambiguous);
+    const char *path = pxc_unique_import_path(result, index, local_name, &ambiguous);
     if (ambiguous)
         return NULL;
     const char *source_leaf = pxc_import_leaf(path);
@@ -745,10 +836,43 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
     return qualified;
 }
 
-static bool pxc_import_map_has_local(const char *const *keys, int count, const char *local_name) {
+/* Record a key the import map now holds in *added, or drop the set when it
+ * cannot take the key (pxc_import_map_has_local then scans the keys). */
+static void pxc_import_map_note_key(CBMHashTable **added, const char *key) {
+    static char member; /* the set's value: any non-NULL pointer */
+    if (!*added) {
+        return;
+    }
+    cbm_ht_set(*added, key, &member);
+    if (!cbm_ht_has(*added, key)) {
+        cbm_ht_free(*added);
+        *added = NULL;
+    }
+}
+
+/* The lookups cbm_pxc_build_import_map makes by local name, when the file has
+ * import metadata to read. */
+static void pxc_import_map_lookups_begin(pxc_import_index_t *index, CBMHashTable **added,
+                                         const CBMFileResult *result, int metadata_count,
+                                         size_t capacity) {
+    if (metadata_count <= 0) {
+        return;
+    }
+    pxc_import_index_build(index, result);
+    *added = cbm_ht_create((uint32_t)capacity);
+}
+
+/* `added` (optional) holds every key in keys[0..count). */
+static bool pxc_import_map_has_local(const char *const *keys, int count, const CBMHashTable *added,
+                                     const char *local_name) {
     if (!keys || !local_name)
         return false;
+    if (added) {
+        pxc_test_note_import_scan();
+        return cbm_ht_has(added, local_name);
+    }
     for (int i = 0; i < count; i++) {
+        pxc_test_note_import_scan();
         if (keys[i] && strcmp(keys[i], local_name) == 0)
             return true;
     }
@@ -841,6 +965,11 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
         free(vals);
         return 0;
     }
+    /* Python and Kotlin read the import metadata by local name, once per edge
+     * and once per import; index it, and the keys added, up front. */
+    pxc_import_index_t index = {0};
+    CBMHashTable *added = NULL;
+    pxc_import_map_lookups_begin(&index, &added, result, metadata_count, capacity);
     int count = 0;
     for (int i = 0; i < edge_count; i++) {
         const cbm_gbuf_edge_t *e = edges[i];
@@ -860,7 +989,7 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
             continue;
         memcpy(local, start, n);
         local[n] = '\0';
-        char *value = pxc_import_value_qn(lang, result, local, target);
+        char *value = pxc_import_value_qn(lang, result, &index, local, target);
         if (!value) {
             free(local);
             continue;
@@ -868,6 +997,7 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
         keys[count] = local;
         vals[count] = value;
         count++;
+        pxc_import_map_note_key(&added, local);
     }
 
     /* IMPORTS edges are best-effort graph relationships. The cross-LSP still
@@ -877,16 +1007,16 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
     for (int i = 0; i < metadata_count; i++) {
         const CBMImport *imp = &result->imports.items[i];
         if (!imp->local_name || !imp->local_name[0] || !imp->module_path ||
-            pxc_import_map_has_local(keys, count, imp->local_name)) {
+            pxc_import_map_has_local(keys, count, added, imp->local_name)) {
             continue;
         }
         bool ambiguous = false;
-        const char *path = pxc_unique_import_path(result, imp->local_name, &ambiguous);
+        const char *path = pxc_unique_import_path(result, &index, imp->local_name, &ambiguous);
         if (ambiguous || !path)
             continue;
         char *value =
             lang == CBM_LANG_KOTLIN
-                ? pxc_kotlin_import_from_metadata(result, imp->local_name)
+                ? pxc_kotlin_import_from_metadata(result, &index, imp->local_name)
                 : pxc_python_import_from_metadata(gbuf, project_name, imp->local_name, path);
         if (!value)
             continue;
@@ -898,7 +1028,10 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
         keys[count] = local;
         vals[count] = value;
         count++;
+        pxc_import_map_note_key(&added, local);
     }
+    cbm_ht_free(added);
+    pxc_import_index_free(&index);
     *out_keys = keys;
     *out_vals = vals;
     *out_count = count;

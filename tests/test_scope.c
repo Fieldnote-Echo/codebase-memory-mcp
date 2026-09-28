@@ -249,6 +249,71 @@ TEST(scope_rebind_in_old_chunk) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* A frame holding n bindings (a module that imports thousands of names) is
+ * indexed by name: binding and looking up each of its names compares O(n)
+ * names, where scanning the frame compared O(n^2). The answers are the
+ * scan's: rebinding updates in place, a child's binding shadows, a parent's
+ * is found through an indexed child, and a missing name stays missing. */
+static bool scope_wide_frame_work(int n, uint64_t *out_compares) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *s = cbm_scope_push(&a, root);
+    const CBMType *first = named_t(&a, "First");
+    const CBMType *second = named_t(&a, "Second");
+    cbm_scope_bind_callable(root, "outer", first, "pkg.outer");
+    cbm_scope_bind(root, "v0", first);
+    char **names = (char **)cbm_arena_alloc(&a, (size_t)n * sizeof(char *));
+    bool ok = names != NULL;
+    for (int i = 0; ok && i < n; i++) {
+        names[i] = cbm_arena_sprintf(&a, "v%d", i);
+        ok = names[i] != NULL;
+    }
+    cbm_scope_test_reset();
+    for (int i = 0; ok && i < n; i++) {
+        ok = cbm_scope_bind_checked(s, names[i], first);
+    }
+    for (int i = 0; ok && i < n; i += 2) {
+        ok = cbm_scope_bind_callable_checked(s, names[i], second, names[i]);
+    }
+    for (int i = 0; ok && i < n; i++) {
+        const CBMType *expected = (i % 2 == 0) ? second : first;
+        ok = cbm_scope_contains(s, names[i]) && cbm_scope_lookup(s, names[i]) == expected &&
+             (i % 2 == 0 ? cbm_scope_lookup_callable(s, names[i]) == names[i]
+                         : cbm_scope_lookup_callable(s, names[i]) == NULL);
+    }
+    ok = ok && cbm_scope_update_callable(s, names[n - 1], "pkg.last") &&
+         strcmp(cbm_scope_lookup_callable(s, names[n - 1]), "pkg.last") == 0;
+    ok = ok && cbm_scope_lookup(s, "outer") == first &&
+         strcmp(cbm_scope_lookup_callable(s, "outer"), "pkg.outer") == 0 &&
+         cbm_scope_lookup(root, "v0") == first && !cbm_scope_contains(s, "missing") &&
+         cbm_type_is_unknown(cbm_scope_lookup(s, "missing"));
+    *out_compares = cbm_scope_test_name_compares();
+    cbm_arena_destroy(&a);
+    return ok;
+}
+
+TEST(scope_wide_frame_binds_and_looks_up_linearly) {
+    enum { SMALL = 256, BIG = 2048, INPUT_GROWTH = 8, RATIO_MAX = 12 };
+    uint64_t small = 0;
+    uint64_t big = 0;
+    ASSERT_TRUE(scope_wide_frame_work(SMALL, &small));
+    ASSERT_TRUE(scope_wide_frame_work(BIG, &big));
+    fprintf(stderr, "  [scope-wide-frame] compares(%d)=%llu compares(%d)=%llu\n", SMALL,
+            (unsigned long long)small, BIG, (unsigned long long)big);
+    ASSERT_GTE(small, (uint64_t)SMALL);
+    if (big > small * RATIO_MAX + 256U) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "scope name compares grew from %llu to %llu for %dx input (maximum %dx + 256)",
+                 (unsigned long long)small, (unsigned long long)big, INPUT_GROWTH, RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+#endif
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(scope) {
@@ -265,4 +330,7 @@ SUITE(scope) {
     RUN_TEST(scope_dynamic_growth_300_bindings);
     RUN_TEST(scope_growth_chunk_boundary);
     RUN_TEST(scope_rebind_in_old_chunk);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(scope_wide_frame_binds_and_looks_up_linearly);
+#endif
 }

@@ -16,6 +16,7 @@
 #include "result_spill.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "iris_export_xml.h"
+#include "grammar_cases.h" /* CBM_GRAMMAR_CASES (usage-context cross-check) */
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -7020,6 +7021,767 @@ TEST(extract_csharp_argument_values_use_the_walk_cursor) {
     }
     PASS();
 }
+
+/* Every identifier the usage classifiers see raises questions about its
+ * ANCESTORS: is it in a binding position, an assignment target, a call-argument
+ * label, a Python default value, under a global statement? Tree-sitter nodes
+ * have no parent pointer, so answering by climbing costs O(depth) per
+ * identifier: ts_node_parent re-descends from the root at every step, and even
+ * a climb on a copy of the walk cursor copies the cursor's whole stack first. A
+ * long left-nested expression puts every identifier deep in the tree, which
+ * made extraction quadratic in the chain length (cubic for Python): a 128 KB
+ * cargo dep-info file read as D spent 13-15 s in the walk. The walk now
+ * carries those answers down as it descends. Count the climbing itself (steps
+ * toward the root and cursor stack entries copied), which is deterministic and
+ * independent of sanitizer speed. */
+typedef struct {
+    uint64_t ancestor_steps;
+    uint64_t cursor_copies;
+    uint64_t slow_parents; /* ts_node_parent fallbacks (root descents) */
+    int usages;            /* usages named `ref` */
+    size_t arena_bytes;    /* the result arena's total allocation */
+} UsageClimbWork;
+
+/* Extract prefix + open*count + middle + close*count + suffix. */
+static bool extract_nested_climb_work(CBMLanguage language, const char *path, const char *prefix,
+                                      const char *open, int count, const char *middle,
+                                      const char *close, const char *suffix, const char *ref,
+                                      UsageClimbWork *out) {
+    size_t prefix_len = strlen(prefix);
+    size_t open_len = strlen(open);
+    size_t middle_len = strlen(middle);
+    size_t close_len = strlen(close);
+    size_t suffix_len = strlen(suffix);
+    size_t capacity =
+        prefix_len + (size_t)count * (open_len + close_len) + middle_len + suffix_len + 1U;
+    char *source = malloc(capacity);
+    if (!source) {
+        return false;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, prefix_len);
+    offset += prefix_len;
+    for (int i = 0; i < count; i++) {
+        memcpy(source + offset, open, open_len);
+        offset += open_len;
+    }
+    memcpy(source + offset, middle, middle_len);
+    offset += middle_len;
+    for (int i = 0; i < count; i++) {
+        memcpy(source + offset, close, close_len);
+        offset += close_len;
+    }
+    memcpy(source + offset, suffix, suffix_len + 1U);
+    offset += suffix_len;
+
+    /* The usage-context cross-check deliberately climbs as well, so a gate run
+     * with it enabled must not count those climbs against the walk. */
+    char check[8] = "";
+    const char *check_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check_env) {
+        snprintf(check, sizeof(check), "%s", check_env);
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, language, "proj", path, 0, NULL, NULL);
+    if (check_env) {
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", check, 1);
+    }
+    free(source);
+    if (!result) {
+        return false;
+    }
+    out->usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, ref) == 0) {
+            out->usages++;
+        }
+    }
+    out->ancestor_steps = cbm_usage_ancestor_step_test_count();
+    out->cursor_copies = cbm_usage_cursor_copy_test_entries();
+    out->slow_parents = cbm_usage_slow_parent_fallback_test_count();
+    out->arena_bytes = cbm_arena_total(&result->arena);
+    cbm_free_result(result);
+    return true;
+}
+
+/* `terms` occurrences of `a` joined by " + ". */
+static bool extract_chain_climb_work(CBMLanguage language, const char *path, const char *prefix,
+                                     int terms, const char *suffix, UsageClimbWork *out) {
+    return extract_nested_climb_work(language, path, prefix, "a + ", terms - 1, "a", "", suffix,
+                                     "a", out);
+}
+
+static void report_chain_climb_work(const char *label, int small_terms, const UsageClimbWork *small,
+                                    int big_terms, const UsageClimbWork *big) {
+    fprintf(
+        stderr,
+        "  [%s] steps(%d)=%llu steps(%d)=%llu cursor_copies(%d)=%llu "
+        "cursor_copies(%d)=%llu slow_parents(%d)=%llu slow_parents(%d)=%llu "
+        "usages(%d)=%d usages(%d)=%d\n",
+        label, small_terms, (unsigned long long)small->ancestor_steps, big_terms,
+        (unsigned long long)big->ancestor_steps, small_terms,
+        (unsigned long long)small->cursor_copies, big_terms, (unsigned long long)big->cursor_copies,
+        small_terms, (unsigned long long)small->slow_parents, big_terms,
+        (unsigned long long)big->slow_parents, small_terms, small->usages, big_terms, big->usages);
+}
+
+TEST(extract_deep_d_chain_does_not_climb_per_identifier) {
+    enum { SMALL = 64, BIG = 512 };
+    /* Module level and inside a function: the dep-info inputs are the former,
+     * and a function body adds scope frames on the path. */
+    static const struct {
+        const char *label;
+        const char *prefix;
+        const char *suffix;
+    } shapes[] = {
+        {"d-chain-module", "auto v = ", ";\n"},
+        {"d-chain-function", "void f() {\n    auto v = ", ";\n}\n"},
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        UsageClimbWork small = {0};
+        UsageClimbWork big = {0};
+        ASSERT_TRUE(extract_chain_climb_work(CBM_LANG_DLANG, "chain.d", shapes[i].prefix, SMALL,
+                                             shapes[i].suffix, &small));
+        ASSERT_TRUE(extract_chain_climb_work(CBM_LANG_DLANG, "chain.d", shapes[i].prefix, BIG,
+                                             shapes[i].suffix, &big));
+        report_chain_climb_work(shapes[i].label, SMALL, &small, BIG, &big);
+        /* Anti-vacuous: every occurrence really was classified as a read. */
+        ASSERT_EQ(small.usages, SMALL);
+        ASSERT_EQ(big.usages, BIG);
+        /* D stamps no callable-value candidates, so nothing is left that
+         * should step toward the root at all. */
+        ASSERT_EQ(small.ancestor_steps, 0);
+        ASSERT_EQ(big.ancestor_steps, 0);
+        ASSERT_EQ(small.cursor_copies, 0);
+        ASSERT_EQ(big.cursor_copies, 0);
+    }
+    PASS();
+}
+
+TEST(extract_deep_python_chain_does_not_climb_per_identifier) {
+    enum { SMALL = 64, BIG = 512, INPUT_GROWTH = 8, STEP_RATIO_MAX = 12 };
+    UsageClimbWork small = {0};
+    UsageClimbWork big = {0};
+    ASSERT_TRUE(extract_chain_climb_work(CBM_LANG_PYTHON, "chain.py", "def f():\n    return ",
+                                         SMALL, "\n", &small));
+    ASSERT_TRUE(extract_chain_climb_work(CBM_LANG_PYTHON, "chain.py", "def f():\n    return ", BIG,
+                                         "\n", &big));
+    report_chain_climb_work("python-chain", SMALL, &small, BIG, &big);
+    ASSERT_EQ(small.usages, SMALL);
+    ASSERT_EQ(big.usages, BIG);
+    ASSERT_EQ(small.cursor_copies, 0);
+    ASSERT_EQ(big.cursor_copies, 0);
+    /* The callable-value site walk still takes its bounded one or two steps per
+     * identifier. What must not happen is a climb that grows with the chain. */
+    uint64_t maximum = small.ancestor_steps * STEP_RATIO_MAX + 256U;
+    if (big.ancestor_steps > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "python chain ancestor steps grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- a classifier climbs per identifier",
+                 (unsigned long long)small.ancestor_steps, (unsigned long long)big.ancestor_steps,
+                 INPUT_GROWTH, STEP_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* The same guard for the classifiers the carried answers above do not cover.
+ * Each shape nests one construct `count` deep and made one of them climb per
+ * occurrence:
+ *   - a parent peek per identifier (Rust scoped paths, Python attribute
+ *     arguments), each a ts_node_parent descent from the root;
+ *   - a language's binding policy (Elixir def heads, Lisp definition forms,
+ *     TLA+ operator parameters, Julia function heads), which climbed from
+ *     every named leaf to the nearest form that decides;
+ *   - the call-side definition-role check, which climbed from every call;
+ *   - the import-binding check, which climbed from every import identifier to
+ *     the import statement.
+ * Stepping the walk's frames is O(1), so steps may grow with the input but not
+ * faster; a root descent is never needed. */
+TEST(extract_deep_nesting_does_not_climb_per_occurrence) {
+    enum { SMALL = 32, BIG = 256, INPUT_GROWTH = 8, STEP_RATIO_MAX = 12 };
+    static const struct {
+        const char *label;
+        CBMLanguage lang;
+        const char *path;
+        const char *prefix;
+        const char *open;
+        const char *middle;
+        const char *close;
+        const char *suffix;
+        const char *ref;      /* a name the shape still emits as usages */
+        int usages_per_level; /* usages of ref per nesting level (0: exactly one) */
+    } shapes[] = {
+        {"rust-binop", CBM_LANG_RUST, "chain.rs", "fn f() -> i32 { ", "a + ", "a", "", " }\n", "a",
+         1},
+        {"python-attribute-argument", CBM_LANG_PYTHON, "attr.py", "def f():\n    return g(a", ".b",
+         "", "", ")\n", "a", 0},
+        {"elixir-binop", CBM_LANG_ELIXIR, "chain.ex", "defmodule M do\n  def f do\n    ", "a + ",
+         "a", "", "\n  end\nend\n", "a", 1},
+        {"elixir-calls", CBM_LANG_ELIXIR, "calls.ex", "defmodule M do\n  def f do\n    ", "g(", "a",
+         ")", "\n  end\nend\n", "a", 0},
+        {"clojure-lists", CBM_LANG_CLOJURE, "lists.clj", "(defn f []\n  ", "(+ a ", "a", ")", ")\n",
+         "a", 1},
+        {"commonlisp-lists", CBM_LANG_COMMONLISP, "lists.lisp", "(defun f ()\n  ", "(+ a ", "a",
+         ")", ")\n", "a", 1},
+        {"tlaplus-binop", CBM_LANG_TLAPLUS, "M.tla", "---- MODULE M ----\nOp == ", "a + ", "a", "",
+         "\n====\n", "a", 1},
+        {"julia-calls", CBM_LANG_JULIA, "calls.jl", "function f()\n    ", "g(", "a", ")", "\nend\n",
+         "a", 0},
+        {"rust-use-lists", CBM_LANG_RUST, "use.rs", "use ", "a::{", "x", "}",
+         ";\nfn f() -> i32 { x }\n", "x", 0},
+        {"python-module-calls", CBM_LANG_PYTHON, "calls.py", "x = ", "f(", "a", ")", "\n", "a", 0},
+        /* The Dart forward-callee check reads each identifier's next named
+         * sibling, which the runtime finds from its parent: a root descent. */
+        {"dart-binop", CBM_LANG_DART, "chain.dart", "int f() { return ", "a + ", "a", "", "; }\n",
+         "a", 1},
+        /* VHDL's reads the sibling of each name wrapper up to four levels up. */
+        {"vhdl-binop", CBM_LANG_VHDL, "chain.vhd", "architecture rtl of e is\nbegin\n  y <= ",
+         "a + ", "a", "", ";\nend architecture;\n", "a", 1},
+    };
+    /* Every shape is measured and reported before the verdict, so one run
+     * shows all that fail. */
+    char message[256] = "";
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        UsageClimbWork small = {0};
+        UsageClimbWork big = {0};
+        ASSERT_TRUE(extract_nested_climb_work(
+            shapes[i].lang, shapes[i].path, shapes[i].prefix, shapes[i].open, SMALL,
+            shapes[i].middle, shapes[i].close, shapes[i].suffix, shapes[i].ref, &small));
+        ASSERT_TRUE(extract_nested_climb_work(
+            shapes[i].lang, shapes[i].path, shapes[i].prefix, shapes[i].open, BIG, shapes[i].middle,
+            shapes[i].close, shapes[i].suffix, shapes[i].ref, &big));
+        report_chain_climb_work(shapes[i].label, SMALL, &small, BIG, &big);
+        /* Anti-vacuous: the occurrences were really walked and classified. */
+        int per_level = shapes[i].usages_per_level;
+        ASSERT_EQ(small.usages, per_level ? per_level * SMALL + 1 : 1);
+        ASSERT_EQ(big.usages, per_level ? per_level * BIG + 1 : 1);
+        const char *failure = NULL;
+        if (small.slow_parents != 0 || big.slow_parents != 0) {
+            failure = "a parent lookup descended from the root";
+        } else if (small.cursor_copies != 0 || big.cursor_copies != 0) {
+            failure = "a climb copied the walk cursor";
+        } else if (big.ancestor_steps > small.ancestor_steps * STEP_RATIO_MAX + 256U) {
+            failure = "ancestor steps grew faster than the input";
+        }
+        if (failure && !message[0]) {
+            snprintf(message, sizeof(message),
+                     "%s: %s (steps %llu -> %llu, slow parents %llu -> %llu for %dx input; "
+                     "maximum %dx + 256 steps, 0 slow parents)",
+                     shapes[i].label, failure, (unsigned long long)small.ancestor_steps,
+                     (unsigned long long)big.ancestor_steps, (unsigned long long)small.slow_parents,
+                     (unsigned long long)big.slow_parents, INPUT_GROWTH, STEP_RATIO_MAX);
+        }
+        if (failure) {
+            fprintf(stderr, "  [%s] FAILS: %s\n", shapes[i].label, failure);
+        }
+    }
+    if (message[0]) {
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* Extract prefix + stem0 + sep + stem1 + ... + stem<count-1> + suffix and
+ * report the result arena's total allocation. */
+static bool extract_numbered_list_arena(CBMLanguage language, const char *path, const char *prefix,
+                                        const char *stem, const char *sep, int count,
+                                        const char *suffix, size_t *arena_bytes) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    size_t item_max = strlen(stem) + strlen(sep) + 12U;
+    size_t capacity = prefix_len + (size_t)count * item_max + suffix_len + 1U;
+    char *source = malloc(capacity);
+    if (!source) {
+        return false;
+    }
+    size_t offset = 0;
+    memcpy(source, prefix, prefix_len);
+    offset += prefix_len;
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(source + offset, capacity - offset, "%s%s%d", i ? sep : "", stem, i);
+        if (n < 0 || (size_t)n >= capacity - offset) {
+            free(source);
+            return false;
+        }
+        offset += (size_t)n;
+    }
+    memcpy(source + offset, suffix, suffix_len + 1U);
+    offset += suffix_len;
+    /* The cross-checks deliberately repeat work; keep them out of the count. */
+    char check[8] = "";
+    const char *check_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check_env) {
+        snprintf(check, sizeof(check), "%s", check_env);
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, language, "proj", path, 0, NULL, NULL);
+    if (check_env) {
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", check, 1);
+    }
+    free(source);
+    if (!result) {
+        return false;
+    }
+    *arena_bytes = cbm_arena_total(&result->arena);
+    cbm_free_result(result);
+    return true;
+}
+
+/* A file's extraction result owns an arena that is never freed piecemeal, so
+ * any O(n^2) scratch copying shows up in it, and its total is deterministic.
+ * Each shape once cost quadratic arena bytes:
+ *   - every member node of a chain a.b.c... copied its whole text to test it
+ *     against the environment-access patterns (process.env, os.environ);
+ *   - the JS/TS and Python resolvers grew their import tables by one element
+ *     per import, copying the table each time (512 MB for 8000 names). */
+TEST(extract_long_chains_and_import_lists_allocate_linearly) {
+    enum { SMALL = 256, BIG = 2048, INPUT_GROWTH = 8, BYTES_RATIO_MAX = 12 };
+    static const size_t SLACK = (size_t)64 * 1024;
+    static const struct {
+        const char *label;
+        CBMLanguage lang;
+        const char *path;
+        const char *prefix;
+        const char *stem; /* NULL: a member chain `prefix` + `sep`*count */
+        const char *sep;
+        const char *suffix;
+    } shapes[] = {
+        {"js-member-chain", CBM_LANG_JAVASCRIPT, "chain.js", "x = a", NULL, ".b", ";\n"},
+        {"ts-member-chain", CBM_LANG_TYPESCRIPT, "chain.ts", "const x = a", NULL, ".b", ";\n"},
+        {"js-named-imports", CBM_LANG_JAVASCRIPT, "imports.js", "import {", "a", ", ",
+         "} from \"m\";\n"},
+        {"ts-named-imports", CBM_LANG_TYPESCRIPT, "imports.ts", "import {", "a", ", ",
+         "} from \"m\";\n"},
+        {"python-from-import", CBM_LANG_PYTHON, "imports.py", "from m import (", "a", ", ", ")\n"},
+    };
+    char message[256] = "";
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        size_t small = 0;
+        size_t big = 0;
+        if (shapes[i].stem) {
+            ASSERT_TRUE(extract_numbered_list_arena(shapes[i].lang, shapes[i].path,
+                                                    shapes[i].prefix, shapes[i].stem, shapes[i].sep,
+                                                    SMALL, shapes[i].suffix, &small));
+            ASSERT_TRUE(extract_numbered_list_arena(shapes[i].lang, shapes[i].path,
+                                                    shapes[i].prefix, shapes[i].stem, shapes[i].sep,
+                                                    BIG, shapes[i].suffix, &big));
+        } else {
+            UsageClimbWork work = {0};
+            ASSERT_TRUE(extract_nested_climb_work(shapes[i].lang, shapes[i].path, shapes[i].prefix,
+                                                  shapes[i].sep, SMALL, "", "", shapes[i].suffix,
+                                                  "b", &work));
+            small = work.arena_bytes;
+            ASSERT_TRUE(extract_nested_climb_work(shapes[i].lang, shapes[i].path, shapes[i].prefix,
+                                                  shapes[i].sep, BIG, "", "", shapes[i].suffix, "b",
+                                                  &work));
+            big = work.arena_bytes;
+        }
+        fprintf(stderr, "  [%s] arena(%d)=%zu arena(%d)=%zu\n", shapes[i].label, SMALL, small, BIG,
+                big);
+        ASSERT_GT(small, 0);
+        if (big > small * BYTES_RATIO_MAX + SLACK) {
+            fprintf(stderr, "  [%s] FAILS: arena grew faster than the input\n", shapes[i].label);
+            if (!message[0]) {
+                snprintf(
+                    message, sizeof(message),
+                    "%s: arena bytes grew from %zu to %zu for %dx input (maximum %dx + 64 KiB)",
+                    shapes[i].label, small, big, INPUT_GROWTH, BYTES_RATIO_MAX);
+            }
+        }
+    }
+    if (message[0]) {
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* prefix + open*depth + "a" + close*depth + suffix, NUL-terminated (malloc). */
+static char *nested_call_source(const char *prefix, const char *open, int depth, const char *close,
+                                const char *suffix) {
+    const char *parts[] = {prefix, open, "a", close, suffix};
+    const int repeats[] = {1, depth, 1, depth, 1};
+    size_t cap = 1U;
+    for (size_t p = 0; p < 5U; p++) {
+        cap += strlen(parts[p]) * (size_t)repeats[p];
+    }
+    char *s = malloc(cap);
+    if (!s) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (size_t p = 0; p < 5U; p++) {
+        size_t len = strlen(parts[p]);
+        for (int k = 0; k < repeats[p]; k++) {
+            memcpy(s + at, parts[p], len);
+            at += len;
+        }
+    }
+    s[at] = '\0';
+    return s;
+}
+
+/* Extract src with the usage-context cross-check off: it deliberately runs
+ * the old per-identifier climbs, which these deep inputs make quadratic. */
+static CBMFileResult *extract_without_usage_check(const char *src, CBMLanguage lang,
+                                                  const char *path) {
+    char check[8] = "";
+    const char *check_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check_env) {
+        snprintf(check, sizeof(check), "%s", check_env);
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), lang, "proj", path, 0, NULL, NULL);
+    if (check_env) {
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", check, 1);
+    }
+    return r;
+}
+
+/* The first call named exactly `callee`, or NULL. */
+static const CBMCall *call_named(const CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return &r->calls.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Each argument of f(f(f(a))) holds every call inside it, and every call kept
+ * its arguments' whole text: 540 MB of arena for a 48 KB Python file nesting
+ * 16000 calls. A long composite argument now keeps a bounded prefix, so the
+ * argument text captured grows with the input. */
+static bool nested_call_argument_bytes(CBMLanguage lang, const char *path, const char *prefix,
+                                       const char *open, int depth, const char *close,
+                                       const char *suffix, const char *callee, size_t *out_bytes,
+                                       int *out_calls) {
+    char *src = nested_call_source(prefix, open, depth, close, suffix);
+    if (!src) {
+        return false;
+    }
+    CBMFileResult *r = extract_without_usage_check(src, lang, path);
+    free(src);
+    if (!r) {
+        return false;
+    }
+    size_t bytes = 0;
+    int calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        calls += c->arg_count > 0 && c->callee_name && strcmp(c->callee_name, callee) == 0;
+        for (int k = 0; k < c->arg_count; k++) {
+            bytes += c->args[k].expr ? strlen(c->args[k].expr) : 0;
+            bytes += c->args[k].value ? strlen(c->args[k].value) : 0;
+            bytes += c->args[k].keyword ? strlen(c->args[k].keyword) : 0;
+        }
+    }
+    cbm_free_result(r);
+    *out_bytes = bytes;
+    *out_calls = calls;
+    return true;
+}
+
+TEST(extract_nested_call_arguments_capture_linearly) {
+    enum { SMALL = 512, BIG = 4096, INPUT_GROWTH = 8, BYTES_RATIO_MAX = 12 };
+    static const struct {
+        const char *label;
+        CBMLanguage lang;
+        const char *path;
+        const char *prefix;
+        const char *open;
+        const char *close;
+        const char *suffix;
+        const char *callee;
+    } shapes[] = {
+        {"python-calls", CBM_LANG_PYTHON, "calls.py", "x = ", "f(", ")", "\n", "f"},
+        {"python-keyword-calls", CBM_LANG_PYTHON, "kw.py", "x = ", "f(k=", ")", "\n", "f"},
+        {"js-calls", CBM_LANG_JAVASCRIPT, "calls.js", "x = ", "f(", ")", ";\n", "f"},
+        {"elixir-calls", CBM_LANG_ELIXIR, "calls.ex", "defmodule M do\n  def f do\n    ", "g(", ")",
+         "\n  end\nend\n", "g"},
+    };
+    char message[256] = "";
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        size_t small = 0;
+        size_t big = 0;
+        int small_calls = 0;
+        int big_calls = 0;
+        ASSERT_TRUE(nested_call_argument_bytes(
+            shapes[i].lang, shapes[i].path, shapes[i].prefix, shapes[i].open, SMALL,
+            shapes[i].close, shapes[i].suffix, shapes[i].callee, &small, &small_calls));
+        ASSERT_TRUE(nested_call_argument_bytes(
+            shapes[i].lang, shapes[i].path, shapes[i].prefix, shapes[i].open, BIG, shapes[i].close,
+            shapes[i].suffix, shapes[i].callee, &big, &big_calls));
+        fprintf(stderr, "  [%s] arg_bytes(%d)=%zu arg_bytes(%d)=%zu calls=%d/%d\n", shapes[i].label,
+                SMALL, small, BIG, big, small_calls, big_calls);
+        /* Anti-vacuous: every nesting level was captured as a call. */
+        ASSERT_EQ(small_calls, SMALL);
+        ASSERT_EQ(big_calls, BIG);
+        if (big > small * BYTES_RATIO_MAX) {
+            fprintf(stderr, "  [%s] FAILS: argument text grew faster than the input\n",
+                    shapes[i].label);
+            if (!message[0]) {
+                snprintf(message, sizeof(message),
+                         "%s: argument text grew from %zu to %zu bytes for %dx input "
+                         "(maximum %dx)",
+                         shapes[i].label, small, big, INPUT_GROWTH, BYTES_RATIO_MAX);
+            }
+        }
+    }
+    if (message[0]) {
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* What the bound may and may not cut. A clipped argument holds exactly the
+ * first CBM_CALL_ARG_EXPR_PREFIX bytes of its text, and the texts a consumer
+ * reads whole stay whole: every argument of a call with a '/'-led argument
+ * (the route handler lookup reads it), and a text opening with '`' (the URL
+ * detector reads it). */
+TEST(extract_call_argument_text_keeps_what_consumers_read) {
+    enum { DEPTH = 400 }; /* the outer arguments are 3 * 400 bytes long */
+    char *src = nested_call_source("x = ", "f(", DEPTH, ")", "\n");
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract_without_usage_check(src, CBM_LANG_PYTHON, "calls.py");
+    ASSERT_NOT_NULL(r);
+    int clipped = 0;
+    int checked = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->arg_count != 1 || strcmp(c->callee_name, "f") != 0) {
+            continue;
+        }
+        /* The call's text is "f(" + argument + ")". */
+        const char *arg = src + c->site_start_byte + 2;
+        size_t full = (size_t)(c->site_end_byte - c->site_start_byte) - 3U;
+        const char *expr = c->args[0].expr;
+        ASSERT_NOT_NULL(expr);
+        if (full > CBM_CALL_ARG_EXPR_PREFIX) {
+            ASSERT_EQ(strlen(expr), CBM_CALL_ARG_EXPR_PREFIX);
+            clipped++;
+        } else {
+            ASSERT_EQ(strlen(expr), full);
+        }
+        ASSERT_EQ(memcmp(expr, arg, strlen(expr)), 0);
+        checked++;
+    }
+    ASSERT_EQ(checked, DEPTH);
+    ASSERT_GT(clipped, 0);
+    cbm_free_result(r);
+    free(src);
+
+    /* A route registration: its handler argument is resolved whole. */
+    src = nested_call_source("app.get(\"/r\", ", "f(", DEPTH, ")", ")\n");
+    ASSERT_NOT_NULL(src);
+    r = extract_without_usage_check(src, CBM_LANG_PYTHON, "route.py");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *route = call_named(r, "app.get");
+    ASSERT_NOT_NULL(route);
+    ASSERT_EQ(route->arg_count, 2);
+    ASSERT_NOT_NULL(route->args[1].expr);
+    ASSERT_EQ(strlen(route->args[1].expr), (size_t)DEPTH * 3U + 1U);
+    cbm_free_result(r);
+    free(src);
+
+    /* A backtick-led argument: the URL detector reads it whole. */
+    src = nested_call_source("k(`v`.concat(", "f(", DEPTH, ")", "));\n");
+    ASSERT_NOT_NULL(src);
+    r = extract_without_usage_check(src, CBM_LANG_JAVASCRIPT, "tick.js");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *ticked = call_named(r, "k");
+    ASSERT_NOT_NULL(ticked);
+    ASSERT_EQ(ticked->arg_count, 1);
+    ASSERT_NOT_NULL(ticked->args[0].expr);
+    ASSERT_EQ(strlen(ticked->args[0].expr), strlen("`v`.concat()") + (size_t)DEPTH * 3U + 1U);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+#endif
+
+#if defined(CBM_ENABLE_TEST_SEAMS)
+/* The walk answers the classifiers' ancestor questions from frames it carries
+ * down (extract_unified.h, CBMUsageFrame). With CBM_TEST_USAGE_CONTEXT_CHECK
+ * set, every carried answer is also computed by the climb it replaced, and any
+ * disagreement is counted and logged. Run that over one fixture per grammar
+ * and over snippets that reach each rule the transitions encode: whole-binding
+ * and declared containers, value and type barriers, assignment targets and
+ * read-modify-write operators, argument labels, Python defaults, lambdas,
+ * global/nonlocal, JS var/let, Perl code references, the PL/SQL, Elixir and
+ * LinkerScript special cases, field children deeper than the path child, and
+ * malformed input whose MISSING tokens are empty nodes and must still climb. */
+static const struct {
+    CBMLanguage lang;
+    const char *path;
+    const char *src;
+} usage_context_cases[] = {
+    {CBM_LANG_JAVASCRIPT, "a.js",
+     "function f(a, b = c, {d, e: g} = h) {\n"
+     "  var x = y, z;\n  let w = v;\n  const [p, q] = r;\n"
+     "  x = q; x += 1; obj.m = n; obj.k(s); z++;\n"
+     "  call({key: val}, lbl);\n"
+     "  for (var i = 0; i < 3; i++) { t = i ? u : k; }\n"
+     "  const fn = (m1, m2 = m3) => m1 + m2;\n"
+     "  class K { method(pp) { return this.x + pp; } }\n"
+     "}\n"},
+    {CBM_LANG_JAVASCRIPT, "broken.js", "function f( { var x = ; y = z +; }\n"},
+    {CBM_LANG_TYPESCRIPT, "a.ts",
+     "function f(cfg: Config, n: number = d): Result {\n"
+     "  const {a, b}: T = o; let x: U; x = a; return g<T>(x, cfg, n);\n}\n"},
+    {CBM_LANG_PYTHON, "a.py",
+     "import os\nfrom m import a as b\nG = 1\n"
+     "def outer(p, q=G, *args, r: int = G2, **kw):\n"
+     "    global G\n    x = p\n    x += q\n"
+     "    def inner(s=x, t=lambda u=v: u):\n"
+     "        nonlocal x\n        x = s\n"
+     "        return [i for i in t if i]\n"
+     "    y = inner(s=1)\n    obj.attr = y\n    (a, b) = c, d\n"
+     "    with open(p) as fh:\n        pass\n    return y\n"
+     "class C(Base):\n    field = 1\n"
+     "    def m(self, k=field):\n        return self.field\n"
+     "h = lambda z=w: z\n"},
+    {CBM_LANG_PYTHON, "broken.py", "def f(a, b=:\n    return a +\n"},
+    {CBM_LANG_C, "a.c",
+     "int a, b = c;\nstruct S { int f; };\n"
+     "int g(int p, int q) { a = p; s.f = q; a += q; int *z = &a; return z[0] + b; }\n"},
+    {CBM_LANG_C, "broken.c", "int f( { return a + ; }\n"},
+    {CBM_LANG_CPP, "a.cpp",
+     "namespace n { int f(int a = 1) { auto [x, y] = t; x = y; return x; } }\n"},
+    {CBM_LANG_GO, "a.go",
+     "package m\nfunc f(a int) (r int) { x := y; x = z; var w = v; g(k); return x + w }\n"},
+    {CBM_LANG_RUST, "a.rs",
+     "fn f(a: T) -> U { let x = y; let mut z = w; z = x; z += 1; g(k); a::b::c(z) }\n"},
+    {CBM_LANG_JAVA, "A.java",
+     "class A { int f; void m(int a) { int x = y; x = z; f = a; x += 1; g(x); } }\n"},
+    {CBM_LANG_CSHARP, "C.cs",
+     "class C { int F; void M(int a) { var x = y; x = z; F = a; G(n: x); Sink((Target)); } }\n"},
+    {CBM_LANG_KOTLIN, "a.kt", "fun f(a: Int) { val x = y; var z = w; z = x; g(n = v) }\n"},
+    {CBM_LANG_SWIFT, "a.swift", "func f(a: Int) { let x = y; var z = w; z = x; g(label: v) }\n"},
+    {CBM_LANG_RUBY, "a.rb", "def f(a, b = c)\n  x = y\n  x += 1\n  g(k: v)\nend\n"},
+    {CBM_LANG_PHP, "a.php", "<?php function f($a, $b = C) { $x = $y; $x .= $z; g($x); }\n"},
+    {CBM_LANG_ELIXIR, "a.ex",
+     "defmodule M do\n  def f(a) do\n    x = y\n    {p, q} = r\n"
+     "    for i <- l, do: i + p + q\n  end\nend\n"},
+    {CBM_LANG_PERL, "a.pl",
+     "my ($a, $b) = @_;\nmy $x = \\&foo;\nbar(\\&baz, $a);\n"
+     "sub s { my $y = shift; return $y; }\n"},
+    {CBM_LANG_PLSQL, "a.sql",
+     "CREATE OR REPLACE PROCEDURE p(a IN NUMBER) IS\nBEGIN\n  q(a);\n  x := a;\nEND;\n"},
+    {CBM_LANG_LINKERSCRIPT, "a.ld", "SECTIONS { . = 0x100; x = y; z += 1; }\n"},
+    {CBM_LANG_PUPPET, "a.pp", "$x = $y\nclass c($p = $q) { }\n"},
+    {CBM_LANG_MESON, "meson.build", "x = y\nz += x\n"},
+    {CBM_LANG_LUA, "a.lua", "local function f(a, b) local x = y; x = a; return g{k = v} end\n"},
+    /* `local x` names x through a field inherited across an aliased, visible
+     * variable_list, so the field child is a grandchild of the declaration. */
+    {CBM_LANG_LUA, "decl.lua", "local run_before_filter\nlocal p, q\nrun_before_filter = p\n"},
+    {CBM_LANG_SCALA, "a.scala",
+     "object O { def f(a: Int = b): Int = { val x = y; var z = w; z = x; g(n = v) } }\n"},
+    {CBM_LANG_DART, "a.dart", "void f(int a, {int b = 1}) { var x = y; x = a; g(n: x); }\n"},
+    {CBM_LANG_HASKELL, "a.hs", "f a b = let x = a in x + b\n"},
+    {CBM_LANG_OCAML, "a.ml", "let f a b = let x = a in x + b\n"},
+    {CBM_LANG_DLANG, "a.d",
+     "void f(int a, int b = c) { auto x = a; x = b; x += 1; g(x); }\n"
+     "auto v = a + a + a;\n"},
+    {CBM_LANG_DLANG, "deps.d",
+     "/home/u/target/debug/deps/foo-1.d: src/lib.rs src/main.rs\n\nsrc/lib.rs:\n"},
+    {CBM_LANG_BASH, "a.sh", "f() { local x=$1; y=$x; echo \"$y\"; }\n"},
+    {CBM_LANG_R, "a.R", "f <- function(a, b = c) { x <- a; x }\n"},
+    {CBM_LANG_ERLANG, "a.erl", "-module(m).\nf(A, B) -> X = A, X + B.\n"},
+    /* Binding policies and call roles decided at the nearest deciding
+     * ancestor, the parent peeks, and the import rules. */
+    {CBM_LANG_CLOJURE, "a.clj",
+     "(defn f [x y] (let [z x] (+ z (g y))))\n(def h (fn [a] (a 1)))\n"
+     "(defmacro m [& body] `(do ~@body))\n"},
+    {CBM_LANG_SCHEME, "a.scm", "(define (f x) (g (h x)))\n(define y (lambda (a) a))\n"},
+    {CBM_LANG_RACKET, "a.rkt", "#lang racket\n(define (f x) (g x))\n(struct p (a b))\n"},
+    {CBM_LANG_CHIALISP, "a.clsp",
+     "(mod (A B)\n  ; note\n  (defun f (x y) (+ x (g y)))\n  (defconstant K (h A))\n"
+     "  (f A B))\n"},
+    {CBM_LANG_COMMONLISP, "a.lisp",
+     "(defun f (x &optional (y (g 1))) (+ x (h y)))\n(defmacro m (a) `(list ,a))\n"},
+    {CBM_LANG_EMACSLISP, "a.el", "(defun f (x) (g (h x)))\n(defmacro m (a) (list a))\n"},
+    {CBM_LANG_ELIXIR, "b.ex",
+     "defmodule M do\n  def f(a, b) when a > b do\n    g(h(a))\n  end\n"
+     "  defp k(x), do: x\n  defmacro m(y) do\n    quote do: unquote(y)\n  end\nend\n"},
+    {CBM_LANG_TLAPLUS, "M.tla",
+     "---- MODULE M ----\nOp(a, b) == a + b\nF[x \\in S] == x + y\n"
+     "G == \\A z \\in S : z > w\nH == \\E q : q\n====\n"},
+    {CBM_LANG_JULIA, "a.jl", "function f(x)\n    g(h(x))\nend\nk(y) = y + 1\nz = m(1)\n"},
+    {CBM_LANG_TYPST, "a.typ", "#let f(x) = g(x)\n#let (a, b) = (1, 2)\n#f(a)\n"},
+    {CBM_LANG_AGDA, "a.agda", "module A where\nf : Nat -> Nat\nf x = g x\n"},
+    {CBM_LANG_NICKEL, "a.ncl", "let f = fun x y => x + y in f 1 2\n"},
+    {CBM_LANG_ELM, "A.elm", "module A exposing (f)\nf x = g x\n"},
+    {CBM_LANG_RESCRIPT, "a.res", "let f = x => g(x)\nlet y = f(1)\n"},
+    {CBM_LANG_PURESCRIPT, "A.purs", "module A where\nf x = g x\n"},
+    {CBM_LANG_RUST, "use.rs",
+     "use a::{self, b as c, d::{e, f}};\nuse g::h::i;\nextern crate k as l;\n"
+     "fn m() { a::b::n(); let o = p::q; e(c, o); }\n"},
+    {CBM_LANG_PYTHON, "imp.py",
+     "import a.b as c\nfrom d import (e, f as g)\nimport h\n"
+     "k(a.b)\nk((a.b))\nk(key=a.b.c)\nk(a.b.c)\n"},
+    {CBM_LANG_JAVASCRIPT, "imp.js",
+     "import a, {b as c, d} from \"m\";\nimport * as e from \"n\";\nf(a, c, d, e);\n"},
+    {CBM_LANG_TYPESCRIPT, "imp.ts", "import x = require(\"m\");\nimport y = N.z;\nx(y);\n"},
+    {CBM_LANG_VIMSCRIPT, "a.vim", "function! F(a)\n  return a:a + g:b\nendfunction\n"},
+    /* Forward callees: a callee followed by its selector or argument group. */
+    {CBM_LANG_DART, "sel.dart",
+     "void f() { a.b(c); d(e).g; h?.i(); j..k(); l<int>(m); n /* c */ (o); }\n"},
+    {CBM_LANG_VHDL, "calls.vhd",
+     "architecture rtl of e is\nbegin\n  y <= f(a) + g(b, c);\n"
+     "  z <= to_integer(unsigned(x));\n  w <= p.q(r);\nend architecture;\n"},
+};
+
+TEST(extract_usage_context_matches_the_climbs) {
+    char previous[8] = "";
+    const char *previous_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (previous_env) {
+        snprintf(previous, sizeof(previous), "%s", previous_env);
+    }
+    cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", "1", 1);
+    cbm_usage_context_test_reset();
+    int extracted = 0;
+    for (size_t i = 0; i < CBM_GRAMMAR_CASES_COUNT; i++) {
+        const GrammarCase *c = &CBM_GRAMMAR_CASES[i];
+        CBMFileResult *r =
+            cbm_extract_file(c->src, (int)strlen(c->src), c->lang, "proj", c->path, 0, NULL, NULL);
+        if (r) {
+            extracted++;
+            cbm_free_result(r);
+        }
+    }
+    for (size_t i = 0; i < sizeof(usage_context_cases) / sizeof(usage_context_cases[0]); i++) {
+        CBMFileResult *r = cbm_extract_file(
+            usage_context_cases[i].src, (int)strlen(usage_context_cases[i].src),
+            usage_context_cases[i].lang, "proj", usage_context_cases[i].path, 0, NULL, NULL);
+        if (r) {
+            extracted++;
+            cbm_free_result(r);
+        }
+    }
+    if (previous_env) {
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", previous, 1);
+    } else {
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    uint64_t checks = cbm_usage_context_test_checks();
+    uint64_t mismatches = cbm_usage_context_test_mismatches();
+    uint64_t fallbacks = cbm_usage_context_test_fallbacks();
+    fprintf(stderr, "  [usage-context] files=%d checks=%llu mismatches=%llu fallbacks=%llu\n",
+            extracted, (unsigned long long)checks, (unsigned long long)mismatches,
+            (unsigned long long)fallbacks);
+    /* Anti-vacuous: answers really were carried and compared, and the empty
+     * MISSING tokens in the malformed snippets really took the climb. */
+    ASSERT_GTE(checks, 1000);
+    ASSERT_GT(fallbacks, 0);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -8366,6 +9128,15 @@ SUITE(extraction) {
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
+    RUN_TEST(extract_deep_d_chain_does_not_climb_per_identifier);
+    RUN_TEST(extract_deep_python_chain_does_not_climb_per_identifier);
+    RUN_TEST(extract_deep_nesting_does_not_climb_per_occurrence);
+    RUN_TEST(extract_long_chains_and_import_lists_allocate_linearly);
+    RUN_TEST(extract_nested_call_arguments_capture_linearly);
+    RUN_TEST(extract_call_argument_text_keeps_what_consumers_read);
+#endif
+#if defined(CBM_ENABLE_TEST_SEAMS)
+    RUN_TEST(extract_usage_context_matches_the_climbs);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */

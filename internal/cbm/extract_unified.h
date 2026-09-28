@@ -66,6 +66,11 @@ typedef struct {
     const char *qn;
     uint32_t depth;
     uint32_t lexical_scope_id;
+    /* lexical_scope_id of the nearest frame at or below this one that has one
+     * (0: none), so the innermost lexical scope is found in O(1). Scanning
+     * down for it passes every call frame, and a nested call f(f(f(...)))
+     * stacks one per level: O(depth) for every node the walk visits. */
+    uint32_t active_lexical_scope_id;
     uint8_t kind;
     CBMInvocationKind invocation_kind;
     TSNode callee_expr;
@@ -128,6 +133,122 @@ typedef struct {
     uint8_t kind;
 } CBMPythonDirective;
 
+/* Ancestor context for the usage classifiers (extract_usages.c).
+ *
+ * Classifying an occurrence means asking about its ANCESTORS: is it in a
+ * binding position, an assignment target, a call-argument label, a Python
+ * default value, under a global statement? Tree-sitter nodes have no parent
+ * pointer. ts_node_parent re-descends from the root, and a climb on a copy of
+ * the walk cursor first copies the cursor's whole stack, so every climb costs
+ * at least O(depth). One climb per identifier made a long left-nested
+ * expression quadratic or worse: a 128 KB cargo dep-info file read as D spent
+ * 13-15 s in the walk.
+ *
+ * So the walk answers these questions on the way down. frames[d] describes the
+ * node at visible depth d of the current path. The walk is pre-order, so
+ * frames[0..depth] is always exactly that path: a sibling overwrites its
+ * predecessor's slot and nothing is ever popped. Each answer is an inherited
+ * attribute, one O(1) transition per edge from the parent's answer, the
+ * parent's role and the edge. The transition takes the first decisive ancestor,
+ * the same one the upward climb would have stopped at. */
+/* Other climbs stop at the NEAREST ancestor of some description and decide
+ * there: a language's binding policy (Lisp definition forms, Elixir def calls,
+ * TLA+ binders, and its second search), the call-side definition role, the
+ * import statement. frames[d].nearest[slot] is the frames index of the nearest
+ * strict ancestor of frames[d] that decides for `slot`, so finding it is one
+ * lookup; the decision at that ancestor is the climb's own code. */
+enum {
+    CBM_USAGE_NEAREST_POLICY = 0,
+    CBM_USAGE_NEAREST_POLICY_AUX,
+    CBM_USAGE_NEAREST_CALL_ROLE,
+    CBM_USAGE_NEAREST_IMPORT,
+    CBM_USAGE_NEAREST_COUNT,
+};
+
+#define CBM_USAGE_NO_NEAREST UINT32_MAX
+
+typedef struct {
+    TSNode node;
+    uint32_t roles;       /* node's CBM_USAGE_ROLE_* as a parent; resolved at its first child */
+    uint32_t targets;     /* node's CBMUsageTargets record, or CBM_USAGE_NO_TARGETS */
+    uint32_t targets_end; /* target records in use by node and its ancestors */
+    uint32_t context;     /* CBM_USAGE_CONTEXT_* answers for node itself */
+    uint32_t nearest[CBM_USAGE_NEAREST_COUNT]; /* or CBM_USAGE_NO_NEAREST */
+    TSFieldId field_id; /* the field node occupies in its parent; 0 for none */
+} CBMUsageFrame;
+
+#define CBM_USAGE_NO_TARGETS UINT32_MAX
+
+/* Children of a declaration or assignment that the classifiers compare with
+ * the path. ts_node_child_by_field_id scans the parent's children, so these
+ * are resolved once per parent rather than once per descendant. The first
+ * CBM_USAGE_FIELD_TARGET_COUNT slots are field children, in this order.
+ *
+ * A field target is usually a direct child of the parent. A field inherited
+ * through a child that an alias made visible (Lua's `local x` declares
+ * variable_declaration > variable_list > name: identifier) resolves to a
+ * deeper node; `via` then holds the direct child on the way to it. */
+enum {
+    CBM_USAGE_TARGET_NAME = 0,
+    CBM_USAGE_TARGET_PATTERN,
+    CBM_USAGE_TARGET_DECLARATOR,
+    CBM_USAGE_TARGET_PARAMETER,
+    CBM_USAGE_TARGET_PARAMETERS,
+    CBM_USAGE_TARGET_LEFT,
+    CBM_USAGE_TARGET_VARIABLE,
+    CBM_USAGE_TARGET_VARIABLES,
+    CBM_USAGE_TARGET_KEY,
+    CBM_USAGE_TARGET_TARGET,
+    CBM_USAGE_TARGET_DESTINATION,
+    CBM_USAGE_TARGET_VALUE,
+    CBM_USAGE_TARGET_DEFAULT,
+    CBM_USAGE_TARGET_ALIAS,
+    CBM_USAGE_FIELD_TARGET_COUNT,
+    CBM_USAGE_TARGET_FIRST_CHILD = CBM_USAGE_FIELD_TARGET_COUNT,
+    CBM_USAGE_TARGET_FIRST_NAMED_CHILD,
+    CBM_USAGE_TARGET_COUNT,
+};
+
+typedef struct {
+    const void *id[CBM_USAGE_TARGET_COUNT];  /* the target, when a direct child */
+    const void *via[CBM_USAGE_TARGET_COUNT]; /* the direct child above a deeper target */
+} CBMUsageTargets;
+
+typedef struct {
+    CBMUsageFrame *frames;
+    uint32_t frame_capacity;
+    uint32_t depth; /* frames[depth] is the walk's current node */
+    CBMUsageTargets *targets;
+    uint32_t target_capacity;
+    uint32_t *symbol_roles; /* per-walk cache of kind roles, by ts_node_symbol */
+    uint32_t symbol_count;
+    uint8_t *field_flags; /* CBM_USAGE_FIELD_* by field id */
+    uint32_t field_count;
+    TSFieldId target_fields[CBM_USAGE_FIELD_TARGET_COUNT]; /* resolved at first use */
+    bool target_fields_resolved;
+    bool nearest_kept[CBM_USAGE_NEAREST_COUNT]; /* the slots this walk keeps */
+    /* An allocation failed: frames stop being maintained and every classifier
+     * climbs, exactly as before the frames existed. */
+    bool failed;
+    /* Test seams (CBM_ENABLE_TEST_SEAMS). check_mode 1 answers from the frames
+     * and verifies every answer against the climb, logging and counting any
+     * disagreement; 2 also aborts. climb_only answers every query by climbing. */
+    uint8_t check_mode;
+    bool climb_only;
+    uint64_t checks;
+    uint64_t fallbacks;
+    uint64_t mismatches;
+} CBMUsageContext;
+
+/* An upward walk from the walk's current node. Stepping the frames is the walk
+ * cursor climb without copying the cursor first; the cursor copy remains for
+ * a walk whose frames are unavailable. */
+typedef struct {
+    const CBMUsageFrame *frames; /* non-NULL: step through frames */
+    uint32_t level;              /* frames index of the node the climb stands on */
+    TSTreeCursor *cursor;        /* frames == NULL: a copy of the walk cursor */
+} CBMOccurrenceClimb;
+
 // WalkState tracks scope context during the unified cursor walk.
 // Replaces parent-chain walks for enclosing_func_qn, import context, etc.
 typedef struct {
@@ -142,11 +263,17 @@ typedef struct {
     int loop_depth;                     // count of enclosing loop scopes (for bottleneck metrics)
     int branch_depth;                   // count of enclosing branch scopes
 
+    /* Ancestor answers carried down by the walk, and the classifiers' one
+     * upward walk in progress (extract_usages.c). */
+    CBMUsageContext usage_context;
+    CBMOccurrenceClimb occurrence_climb;
+
     CBMArena *arena;
     CBMWalkScope *scopes;
     CBMWalkScope inline_scopes[MAX_SCOPES];
     int scope_capacity;
     int scope_top;
+    int function_scope_count; /* SCOPE_FUNC frames among them */
 
     CBMLexicalScope *lexical_scopes;
     CBMLexicalScope inline_lexical_scopes[INLINE_LEXICAL_SCOPES];
@@ -215,6 +342,30 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                                      WalkState *state);
 void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state);
+
+// Usage ancestor context. init before the walk; enter for EVERY node the walk
+// visits (trivia included), with its visible depth and the field the walk
+// cursor reports for it; free after the walk.
+void cbm_usage_context_init(CBMExtractCtx *ctx, const CBMLangSpec *spec, WalkState *state);
+void cbm_usage_context_enter(CBMExtractCtx *ctx, const CBMLangSpec *spec, WalkState *state,
+                             uint32_t depth, TSNode node, TSFieldId field_id);
+void cbm_usage_context_free(CBMExtractCtx *ctx, WalkState *state);
+/* One step of an ancestor climb outside extract_usages.c, for the step
+ * counter its linearity tests read (a no-op without that test API). */
+void cbm_usage_ancestor_step_note(void);
+/* The nearest strict ancestor of the walk's current node `node` that decides
+ * for `slot` (CBM_USAGE_NEAREST_*), from the frames: true with *ancestor set
+ * (null when none decides), false when the caller must climb. */
+bool cbm_usage_nearest_ancestor(WalkState *state, TSNode node, int slot, TSNode *ancestor);
+/* The usage-context cross-check (CBM_TEST_USAGE_CONTEXT_CHECK) for an answer
+ * taken from the frames outside extract_usages.c. */
+bool cbm_usage_context_checking(const WalkState *state);
+void cbm_usage_context_verify(CBMExtractCtx *ctx, WalkState *state, TSNode node, const char *answer,
+                              bool carried, bool climbed);
+/* Where the call-side definition-role climb (extract_calls.c) stops, for
+ * CBM_USAGE_NEAREST_CALL_ROLE, and the languages it climbs in. */
+bool cbm_call_role_ancestor_decides(CBMLanguage language, TSNode ancestor, const char *source);
+bool cbm_call_role_language(CBMLanguage language);
 void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);

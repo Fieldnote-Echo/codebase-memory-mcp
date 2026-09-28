@@ -136,6 +136,15 @@ typedef struct {
      * (RUST_LSP_FOLLOWUP §B.2). */
     int eval_step_count;
 
+    /* `a + b + c` is a left-deep spine of binary_expressions, and the type of
+     * an arithmetic `x + y` is the type of `x`. Operator desugaring needs every
+     * left operand's type, and evaluating it afresh at each level of the spine
+     * walked the spine below again: O(n^2) evaluations for n terms. A level
+     * hands its left operand's type down instead: `binop_left` and its type
+     * `binop_left_type`, valid only for the next node the resolver enters. */
+    TSNode binop_left;
+    const CBMType *binop_left_type;
+
     /* Cargo.toml manifest, when the caller has parsed one and routed
      * it through. The resolver consults `dep_count`/`member_count` so
      * paths beginning with a workspace member or declared dependency
@@ -377,5 +386,12 @@ typedef struct {
 /* Process several files in one CGo call (per-file arenas, result copy). */
 void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,
                               CBMResolvedCallArray *out);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam: rust_eval_expr_type calls made on the calling
+ * thread since the last reset, a deterministic work counter. */
+void cbm_rust_lsp_test_eval_reset(void);
+uint64_t cbm_rust_lsp_test_evals(void);
+#endif
 
 #endif /* CBM_LSP_RUST_LSP_H */

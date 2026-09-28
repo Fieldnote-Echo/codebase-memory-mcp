@@ -172,6 +172,7 @@ bool cbm_ts_lsp_test_budget_warned(void) {
 #endif
 
 #define TS_LSP_MAX_EVAL_DEPTH 64
+#define TS_LSP_IMPORT_INITIAL_CAP 16
 #define TS_LSP_FIELD_LEN(s) ((uint32_t)(sizeof(s) - 1))
 
 // Tree-sitter grammar entry points for the three TS dialects (compiled into the binary).
@@ -3810,22 +3811,28 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
 void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *module_qn) {
     if (!ctx || !ctx->arena || !local_name || !module_qn)
         return;
-    int new_count = ctx->import_count + 1;
-    const char **names =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    const char **qns =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    if (!names || !qns)
-        return;
-    for (int i = 0; i < ctx->import_count; i++) {
-        names[i] = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
-        qns[i] = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+    /* Doubling capacity: a grow-by-one copy of both arrays per import was
+     * O(n^2) time and never-freed arena bytes for a statement importing n
+     * names (512 MB of arena at 8000). */
+    if (ctx->import_count >= ctx->import_capacity) {
+        int capacity = ctx->import_capacity ? ctx->import_capacity * 2 : TS_LSP_IMPORT_INITIAL_CAP;
+        const char **names =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
+        const char **qns =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
+        if (!names || !qns)
+            return;
+        for (int i = 0; i < ctx->import_count; i++) {
+            names[i] = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+            qns[i] = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+        }
+        ctx->import_local_names = names;
+        ctx->import_module_qns = qns;
+        ctx->import_capacity = capacity;
     }
-    names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
-    qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
-    ctx->import_local_names = names;
-    ctx->import_module_qns = qns;
-    ctx->import_count = new_count;
+    ctx->import_local_names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
+    ctx->import_module_qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->import_count++;
 }
 
 // ── Stdlib seeds (Phase 5 will replace with generator) ────────────────────────

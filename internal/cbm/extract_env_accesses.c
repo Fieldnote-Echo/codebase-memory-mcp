@@ -80,6 +80,19 @@ static const char *extract_env_key_from_call(CBMExtractCtx *ctx, TSNode node,
     return NULL;
 }
 
+/* The length of `text` (text_len bytes) read as a C string: up to its first NUL. */
+static size_t env_text_c_length(const char *text, size_t text_len) {
+    const char *nul = memchr(text, '\0', text_len);
+    return nul ? (size_t)(nul - text) : text_len;
+}
+
+/* The length of the key after `pattern.`: all of the rest (as a C string), or 0
+ * when it is empty or has a further dot or bracket. */
+static size_t env_member_key_length(const char *rest, size_t rest_len) {
+    size_t key_len = env_text_c_length(rest, rest_len);
+    return memchr(rest, '.', key_len) || memchr(rest, '[', key_len) ? 0 : key_len;
+}
+
 // Extract env key from member access like process.env.KEY or os.environ["KEY"].
 static const char *extract_env_key_from_member(CBMExtractCtx *ctx, TSNode node,
                                                const CBMLangSpec *spec) {
@@ -87,27 +100,39 @@ static const char *extract_env_key_from_member(CBMExtractCtx *ctx, TSNode node,
         return NULL;
     }
 
-    char *text = cbm_node_text(ctx->arena, node, ctx->source);
-    if (!text || !text[0]) {
+    /* The node's text is read in place, as the C string a copy of it would be
+     * (up to its first NUL), and only a matched key is copied. Copying the
+     * whole text first cost O(length) arena bytes for every member node, and
+     * a chain a.b.c... nests one member node per link: O(n^2) in all. */
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    const char *text = ctx->source + start;
+    size_t text_len = end > start ? (size_t)(end - start) : 0;
+    if (text_len == 0 || text[0] == '\0') {
         return NULL;
     }
 
     for (const char **pat = spec->env_access_member_patterns; *pat; pat++) {
         size_t plen = strlen(*pat);
+        if (text_len <= plen || memcmp(text, *pat, plen) != 0) {
+            continue;
+        }
+        const char *rest = text + plen + CBM_QUOTE_OFFSET;
+        size_t rest_len = text_len - plen - CBM_QUOTE_OFFSET;
 
         // Dot access: pattern.KEY
-        if (strncmp(text, *pat, plen) == 0 && text[plen] == '.') {
-            const char *key = text + plen + CBM_QUOTE_OFFSET;
+        if (text[plen] == '.') {
             // Validate: no further dots/brackets
-            if (key[0] && !strchr(key, '.') && !strchr(key, '[')) {
-                return key;
+            size_t key_len = env_member_key_length(rest, rest_len);
+            if (key_len > 0) {
+                return cbm_arena_strndup(ctx->arena, rest, key_len);
             }
         }
 
         // Subscript: pattern["KEY"]
-        if (strncmp(text, *pat, plen) == 0 && text[plen] == '[') {
-            const char *inner = text + plen + CBM_QUOTE_OFFSET;
-            size_t ilen = strlen(inner);
+        if (text[plen] == '[') {
+            const char *inner = rest;
+            size_t ilen = env_text_c_length(inner, rest_len);
             if (ilen > 0 && inner[ilen - CBM_QUOTE_OFFSET] == ']') {
                 char *bracket_content =
                     cbm_arena_strndup(ctx->arena, inner, ilen - CBM_QUOTE_OFFSET);

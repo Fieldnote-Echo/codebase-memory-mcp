@@ -83,6 +83,13 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam, per calling thread: import metadata rows and map
+ * keys examined (or hash lookups made) by cbm_pxc_build_import_map. */
+void cbm_pxc_test_import_scan_reset(void);
+uint64_t cbm_pxc_test_import_scan_steps(void);
+#endif
+
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
  * The hot path used to register ALL all_defs[] into a fresh registry

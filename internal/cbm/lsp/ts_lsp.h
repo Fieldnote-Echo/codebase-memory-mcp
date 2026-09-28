@@ -28,10 +28,11 @@ typedef struct {
     CBMScope *current_scope;
 
     // Import map: local_name -> module QN (resolved or opaque).
-    // Parallel arrays of length import_count.
+    // Parallel arrays of length import_count, room for import_capacity.
     const char **import_local_names;
     const char **import_module_qns;
     int import_count;
+    int import_capacity;
 
     // File / surrounding context.
     const char *module_qn;          // QN of this file's module

@@ -48,12 +48,10 @@ static uint32_t current_lexical_scope_id(const WalkState *state) {
     if (!state) {
         return 0;
     }
-    for (int i = state->scope_top - 1; i >= 0; i--) {
-        if (state->scopes[i].lexical_scope_id != 0) {
-            return state->scopes[i].lexical_scope_id;
-        }
-    }
-    return state->root_lexical_scope_id;
+    uint32_t id = state->scope_top > 0
+                      ? state->scopes[state->scope_top - SKIP_ONE].active_lexical_scope_id
+                      : 0;
+    return id ? id : state->root_lexical_scope_id;
 }
 
 static bool ensure_lexical_scope_capacity(WalkState *state) {
@@ -315,6 +313,9 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     f->depth = depth;
     f->qn = qn;
     f->lexical_scope_id = 0;
+    f->active_lexical_scope_id =
+        state->scope_top > 0 ? state->scopes[state->scope_top - SKIP_ONE].active_lexical_scope_id
+                             : 0;
     f->invocation_kind = CBM_INVOCATION_NONE;
     f->callee_expr = (TSNode){0};
     f->callee_leaf = (TSNode){0};
@@ -332,6 +333,7 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     switch (kind) {
     case SCOPE_FUNC:
         state->enclosing_func_qn = qn;
+        state->function_scope_count++;
         break;
     case SCOPE_CLASS:
     case SCOPE_NAMESPACE:
@@ -363,8 +365,12 @@ static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t dep
         state->lexical_binding_tracking_failed = true;
         return false;
     }
-    state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
-        add_lexical_scope(state, node, lexical_kind);
+    uint32_t id = add_lexical_scope(state, node, lexical_kind);
+    CBMWalkScope *frame = &state->scopes[state->scope_top - SKIP_ONE];
+    frame->lexical_scope_id = id;
+    if (id != 0) {
+        frame->active_lexical_scope_id = id;
+    }
     return true;
 }
 
@@ -376,6 +382,7 @@ static bool push_existing_lexical_scope(WalkState *state, uint8_t walk_kind, uin
         return false;
     }
     state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id = lexical_scope_id;
+    state->scopes[state->scope_top - SKIP_ONE].active_lexical_scope_id = lexical_scope_id;
     uint32_t end_byte = ts_node_end_byte(node);
     if (end_byte > scope->end_byte) {
         scope->end_byte = end_byte;
@@ -439,6 +446,9 @@ static void push_call_scope(WalkState *state, uint32_t depth,
 static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
     while (state->scope_top > 0 && state->scopes[state->scope_top - SKIP_ONE].depth >= cur_depth) {
         const CBMWalkScope *f = &state->scopes[--state->scope_top];
+        if (f->kind == SCOPE_FUNC) {
+            state->function_scope_count--;
+        }
         state->enclosing_func_qn = f->prev_enclosing_func_qn;
         state->enclosing_class_qn = f->prev_enclosing_class_qn;
         state->invocation_kind = f->prev_invocation_kind;
@@ -2235,10 +2245,11 @@ static TSNode objectscript_routine_preceding_tag(TSNode node) {
 
 static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                 WalkState *state, uint32_t depth) {
-    for (int i = 0; i < state->scope_top; i++) {
-        if (state->scopes[i].kind == SCOPE_FUNC) {
-            return false;
-        }
+    /* Any function frame on the stack, counted rather than searched for: at
+     * module level the search passed every call frame, and nested calls
+     * f(f(f(...))) stack one per level, O(depth) for every node. */
+    if (state->function_scope_count > 0) {
+        return false;
     }
 
     TSNode label = {0};
@@ -2350,6 +2361,7 @@ static bool node_already_has_lexical_scope(const WalkState *state, TSNode node) 
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);
     for (int i = state->scope_top - 1; i >= 0; i--) {
+        cbm_usage_ancestor_step_note();
         const CBMLexicalScope *scope =
             lexical_scope_by_id(state, state->scopes[i].lexical_scope_id);
         if (scope && scope->start_byte == start && scope->end_byte == end) {
@@ -2361,7 +2373,8 @@ static bool node_already_has_lexical_scope(const WalkState *state, TSNode node) 
 
 static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth) {
     CBMLexicalScopeKind kind;
-    if (!node_already_has_lexical_scope(state, node) && lexical_boundary_kind(node, &kind)) {
+    /* The kind test first: the scope-stack scan is O(depth) per node. */
+    if (lexical_boundary_kind(node, &kind) && !node_already_has_lexical_scope(state, node)) {
         (void)push_lexical_scope(state, SCOPE_LEXICAL, depth, NULL, node, kind);
     }
 }
@@ -2377,15 +2390,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
          * that nodeless local binding — the CALLS edge then sources to neither a
          * Function nor the Module. Only the OUTERMOST value_definition pushes a
          * scope (none already on the stack), matching what the def walk extracts. */
-        bool skip_nested = false;
-        if (ctx->language == CBM_LANG_OCAML) {
-            for (int i = 0; i < state->scope_top; i++) {
-                if (state->scopes[i].kind == SCOPE_FUNC) {
-                    skip_nested = true;
-                    break;
-                }
-            }
-        }
+        bool skip_nested = ctx->language == CBM_LANG_OCAML && state->function_scope_count > 0;
         if (!skip_nested) {
             const char *fqn = compute_func_qn(ctx, node, spec, state);
             if (fqn && push_function_scope(state, depth, fqn, node)) {
@@ -2596,6 +2601,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.inside_import = false;
     state.loop_depth = 0;
     state.branch_depth = 0;
+    cbm_usage_context_init(ctx, spec, &state);
 
     uint32_t depth = 0;
     uint32_t visited = 0;
@@ -2625,6 +2631,10 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             ctx->walk_budget_exhausted = true;
             break;
         }
+        /* Every visited node gets its ancestor frame, trivia included: a
+         * structured extra's children need their parent's. */
+        cbm_usage_context_enter(ctx, spec, &state, depth, node,
+                                ts_tree_cursor_current_field_id(&cursor));
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
@@ -2678,6 +2688,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     cbm_finalize_lexical_usages(ctx, &state);
+    cbm_usage_context_free(ctx, &state);
     ctx->walk_nodes_visited = visited;
     ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);

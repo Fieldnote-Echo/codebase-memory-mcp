@@ -4,24 +4,36 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/mem_core.h" // cbm_realloc -- usage context frames
 #include "extract_node_stack.h"
+#ifdef CBM_ENABLE_TEST_SEAMS
+#include "foundation/log.h" // cbm_log -- usage_context.* (cross-check seam)
+#endif
 
 enum { LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
+#include <stdio.h>  // snprintf
 #include <stdlib.h> // qsort
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
 
-#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+#if (defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API) || \
+    defined(CBM_ENABLE_TEST_SEAMS)
 #include <stdatomic.h>
+#endif
 
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 static _Atomic uint64_t g_usage_field_lookup_work = 0;
 static _Atomic uint64_t g_usage_slow_parent_fallbacks = 0;
+static _Atomic uint64_t g_usage_ancestor_steps = 0;
+static _Atomic uint64_t g_usage_cursor_copy_entries = 0;
 
 void cbm_usage_field_lookup_test_reset(void) {
     atomic_store_explicit(&g_usage_field_lookup_work, 0, memory_order_relaxed);
     atomic_store_explicit(&g_usage_slow_parent_fallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_usage_ancestor_steps, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_usage_cursor_copy_entries, 0, memory_order_relaxed);
 }
 
 uint64_t cbm_usage_field_lookup_test_work(void) {
@@ -32,6 +44,14 @@ uint64_t cbm_usage_slow_parent_fallback_test_count(void) {
     return atomic_load_explicit(&g_usage_slow_parent_fallbacks, memory_order_relaxed);
 }
 
+uint64_t cbm_usage_ancestor_step_test_count(void) {
+    return atomic_load_explicit(&g_usage_ancestor_steps, memory_order_relaxed);
+}
+
+uint64_t cbm_usage_cursor_copy_test_entries(void) {
+    return atomic_load_explicit(&g_usage_cursor_copy_entries, memory_order_relaxed);
+}
+
 static void usage_field_lookup_test_note_work(void) {
     atomic_fetch_add_explicit(&g_usage_field_lookup_work, 1, memory_order_relaxed);
 }
@@ -39,18 +59,41 @@ static void usage_field_lookup_test_note_work(void) {
 static void usage_slow_parent_fallback_test_note(void) {
     atomic_fetch_add_explicit(&g_usage_slow_parent_fallbacks, 1, memory_order_relaxed);
 }
+
+static void usage_ancestor_step_test_note(void) {
+    atomic_fetch_add_explicit(&g_usage_ancestor_steps, 1, memory_order_relaxed);
+}
+
+static void usage_cursor_copy_test_note(uint32_t entries) {
+    atomic_fetch_add_explicit(&g_usage_cursor_copy_entries, entries, memory_order_relaxed);
+}
 #else
 static void usage_field_lookup_test_note_work(void) {}
 static void usage_slow_parent_fallback_test_note(void) {}
+static void usage_ancestor_step_test_note(void) {}
+static void usage_cursor_copy_test_note(uint32_t entries) {
+    (void)entries;
+}
 #endif
+
+void cbm_usage_ancestor_step_note(void) {
+    usage_ancestor_step_test_note();
+}
 
 // Forward declaration
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 static bool is_direct_argument_value(TSNode node);
 static TSNode python_direct_callable_attribute_site(TSNode node);
+static TSNode usage_walk_parent(CBMExtractCtx *ctx, WalkState *state, TSNode node);
+static TSNode usage_walk_owner_parent(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                      uint32_t up, TSNode owner);
+static TSNode usage_walk_next_named_sibling(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                            uint32_t up, TSNode owner);
+static TSNode python_attribute_site_walk(CBMExtractCtx *ctx, WalkState *state, TSNode node);
 
 // Is this an identifier-like node that represents a reference?
-static bool is_reference_node(TSNode node, CBMLanguage lang) {
+static bool is_reference_node(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    CBMLanguage lang = ctx->language;
     const char *kind = ts_node_type(node);
 
     /* Python's attribute node and its terminal identifier describe the same
@@ -59,7 +102,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
      * USAGE) and stamp it with the full attribute span below. Receivers remain
      * independent value references. */
     if (lang == CBM_LANG_PYTHON && strcmp(kind, "attribute") == 0 &&
-        !ts_node_is_null(python_direct_callable_attribute_site(node))) {
+        !ts_node_is_null(python_attribute_site_walk(ctx, state, node))) {
         return false;
     }
 
@@ -68,7 +111,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
      * references; keeping them would let a short-name fallback bind a decoy. */
     if (lang == CBM_LANG_RUST &&
         (strcmp(kind, "identifier") == 0 || strcmp(kind, "scoped_identifier") == 0)) {
-        TSNode parent = ts_node_parent(node);
+        TSNode parent = usage_walk_parent(ctx, state, node);
         if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "scoped_identifier") == 0) {
             return false;
         }
@@ -85,7 +128,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
      * budget on every non-M4 venue). */
     if ((lang == CBM_LANG_PUPPET || lang == CBM_LANG_VIMSCRIPT) &&
         strcmp(kind, "identifier") == 0) {
-        TSNode parent = ts_node_parent(node);
+        TSNode parent = usage_walk_parent(ctx, state, node);
         if (!ts_node_is_null(parent) &&
             ((lang == CBM_LANG_PUPPET && strcmp(ts_node_type(parent), "variable") == 0) ||
              (lang == CBM_LANG_VIMSCRIPT && strcmp(ts_node_type(parent), "argument") == 0))) {
@@ -240,9 +283,10 @@ static TSNode terminal_vhdl_identifier(TSNode node, int remaining_depth) {
 // callee when the call descriptor is created, so suppress only the exact
 // language-specific preceding occurrence. Do not generalize this to arbitrary
 // identifiers: a sibling selector/parenthesis group is the grammar contract.
-static bool is_forward_sibling_callee(CBMLanguage language, TSNode node) {
+static bool is_forward_sibling_callee(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    CBMLanguage language = ctx->language;
     if (language == CBM_LANG_DART && strcmp(ts_node_type(node), "identifier") == 0) {
-        TSNode next = ts_node_next_named_sibling(node);
+        TSNode next = usage_walk_next_named_sibling(ctx, state, node, 0, node);
         return !ts_node_is_null(next) && strcmp(ts_node_type(next), "selector") == 0;
     }
 
@@ -252,12 +296,12 @@ static bool is_forward_sibling_callee(CBMLanguage language, TSNode node) {
 
     TSNode owner = node;
     for (int depth = 0; depth < 4 && vhdl_forward_callee_wrapper(owner); depth++) {
-        TSNode next = ts_node_next_named_sibling(owner);
+        TSNode next = usage_walk_next_named_sibling(ctx, state, node, (uint32_t)depth, owner);
         if (!ts_node_is_null(next) && strcmp(ts_node_type(next), "parenthesis_group") == 0) {
             TSNode leaf = terminal_vhdl_identifier(owner, 8);
             return !ts_node_is_null(leaf) && ts_node_eq(node, leaf);
         }
-        TSNode parent = ts_node_parent(owner);
+        TSNode parent = usage_walk_owner_parent(ctx, state, node, (uint32_t)depth, owner);
         if (ts_node_is_null(parent) || !vhdl_forward_callee_wrapper(parent)) {
             break;
         }
@@ -282,29 +326,392 @@ static const char *field_name_for_node(TSNode parent, TSNode child) {
     return field;
 }
 
-/* The unified walk already owns the exact cursor path to the current node.
- * Reset one reusable scratch cursor to that path before each occurrence
- * classifier, then walk its parents without restarting a sibling scan at
- * every level. Legacy extraction callers retain the node-based fallback. */
-static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
-    if (!state || !state->current_cursor || !state->occurrence_cursor ||
-        !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
-        return NULL;
-    }
-    ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
-    return state->occurrence_cursor;
+/* CBMUsageContext.check_mode (CBM_TEST_USAGE_CONTEXT_CHECK). */
+enum { USAGE_CHECK_REPORT = 1, USAGE_CHECK_ABORT = 2 };
+
+/* Answers the walk carries for a node about its ancestors (see CBMUsageFrame).
+ * Each bit is exactly what the named climb below returns for that node. */
+enum {
+    CBM_USAGE_CONTEXT_BINDING = 1U << 0,          /* standard_binding_climb */
+    CBM_USAGE_CONTEXT_WRITE = 1U << 1,            /* write_climb */
+    CBM_USAGE_CONTEXT_ARGUMENT_LABEL = 1U << 2,   /* call_argument_label_climb */
+    CBM_USAGE_CONTEXT_PY_DEFAULT_VALUE = 1U << 3, /* python_default_value_climb */
+    CBM_USAGE_CONTEXT_IN_GLOBAL = 1U << 4,        /* lexical_ancestor_kind(global_statement) */
+    CBM_USAGE_CONTEXT_IN_NONLOCAL = 1U << 5,      /* lexical_ancestor_kind(nonlocal_statement) */
+    CBM_USAGE_CONTEXT_PARAMETER = 1U << 6,        /* binding_is_parameter_climb */
+    CBM_USAGE_CONTEXT_FUNCTION_NAME = 1U << 7,    /* declared_function_name_owner */
+    CBM_USAGE_CONTEXT_CLASS_NAME = 1U << 8,       /* declared_class_name_owner */
+    CBM_USAGE_CONTEXT_JS_VAR = 1U << 9,           /* js_var_binding_climb */
+    CBM_USAGE_CONTEXT_PERL_CODEREF = 1U << 10,    /* direct_perl_coderef_climb */
+    CBM_USAGE_CONTEXT_IMPORT_ALIAS = 1U << 11,    /* an alias field up to the import contains it */
+};
+
+/* The answer is decided by where the node sits inside a field target deeper
+ * than the path child (CBMUsageTargets.via), so the frames cannot say; the
+ * query climbs. One such bit per containment answer, CBM_USAGE_CONTEXT_* shifted. */
+enum { CBM_USAGE_CONTEXT_UNKNOWN_SHIFT = 16 };
+
+static uint32_t usage_unknown(uint32_t answer) {
+    return answer << CBM_USAGE_CONTEXT_UNKNOWN_SHIFT;
 }
 
-static bool occurrence_parent(TSTreeCursor *cursor, TSNode current, TSNode *parent,
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_usage_context_checks = 0;
+static _Atomic uint64_t g_usage_context_mismatches = 0;
+static _Atomic uint64_t g_usage_context_fallbacks = 0;
+
+void cbm_usage_context_test_reset(void) {
+    atomic_store_explicit(&g_usage_context_checks, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_usage_context_mismatches, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_usage_context_fallbacks, 0, memory_order_relaxed);
+}
+
+uint64_t cbm_usage_context_test_checks(void) {
+    return atomic_load_explicit(&g_usage_context_checks, memory_order_relaxed);
+}
+
+uint64_t cbm_usage_context_test_mismatches(void) {
+    return atomic_load_explicit(&g_usage_context_mismatches, memory_order_relaxed);
+}
+
+uint64_t cbm_usage_context_test_fallbacks(void) {
+    return atomic_load_explicit(&g_usage_context_fallbacks, memory_order_relaxed);
+}
+
+static void usage_context_note_fallback(WalkState *state) {
+    state->usage_context.fallbacks++;
+    atomic_fetch_add_explicit(&g_usage_context_fallbacks, 1, memory_order_relaxed);
+}
+
+static bool usage_context_checking(const WalkState *state) {
+    return state && state->usage_context.check_mode != 0;
+}
+
+/* One carried answer against the climb it replaces (`agree`; the values are
+ * for the report). A disagreement means the frames are wrong, so it is always
+ * reported, and fatal at USAGE_CHECK_ABORT. */
+static void usage_context_report(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                 const char *answer, bool agree, uint64_t carried,
+                                 uint64_t climbed) {
+    state->usage_context.checks++;
+    atomic_fetch_add_explicit(&g_usage_context_checks, 1, memory_order_relaxed);
+    if (agree) {
+        return;
+    }
+    state->usage_context.mismatches++;
+    atomic_fetch_add_explicit(&g_usage_context_mismatches, 1, memory_order_relaxed);
+    char language[16];
+    char bytes[32];
+    char values[48];
+    snprintf(language, sizeof(language), "%d", (int)ctx->language);
+    snprintf(bytes, sizeof(bytes), "%u-%u", ts_node_start_byte(node), ts_node_end_byte(node));
+    snprintf(values, sizeof(values), "%llu/%llu", (unsigned long long)carried,
+             (unsigned long long)climbed);
+    cbm_log_error("usage_context.mismatch", "path", ctx->rel_path ? ctx->rel_path : "", "lang",
+                  language, "answer", answer, "kind", ts_node_type(node), "bytes", bytes,
+                  "carried_climbed", values);
+    if (state->usage_context.check_mode >= USAGE_CHECK_ABORT) {
+        abort();
+    }
+}
+#else
+static void usage_context_note_fallback(WalkState *state) {
+    state->usage_context.fallbacks++;
+}
+
+static bool usage_context_checking(const WalkState *state) {
+    (void)state;
+    return false;
+}
+
+static void usage_context_report(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                 const char *answer, bool agree, uint64_t carried,
+                                 uint64_t climbed) {
+    (void)ctx;
+    (void)state;
+    (void)node;
+    (void)answer;
+    (void)agree;
+    (void)carried;
+    (void)climbed;
+}
+#endif
+
+static void usage_context_verify(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                 const char *answer, bool carried, bool climbed) {
+    usage_context_report(ctx, state, node, answer, carried == climbed, (uint64_t)carried,
+                         (uint64_t)climbed);
+}
+
+/* The frame describing `node` when it is the walk's current node and the walk
+ * keeps frames; NULL sends the caller to its climb. */
+static const CBMUsageFrame *usage_frame_for(const WalkState *state, TSNode node) {
+    if (!state) {
+        return NULL;
+    }
+    const CBMUsageContext *context = &state->usage_context;
+    if (!context->frames || context->failed || context->climb_only) {
+        return NULL;
+    }
+    const CBMUsageFrame *frame = &context->frames[context->depth];
+    return ts_node_eq(frame->node, node) ? frame : NULL;
+}
+
+/* The frame carrying `answer` about `node`, or NULL when the caller must climb.
+ *
+ * Most climbs test byte-range containment (field_contains_node): does the
+ * ancestor's field child contain the node? For a node with a non-empty range
+ * and a field child that is a direct child of the ancestor, it does exactly
+ * when that child IS the path child at that level: siblings never overlap,
+ * and an empty sibling cannot contain a non-empty range. That identity is what
+ * the frames compare. Two cases still climb:
+ *   - an empty node (a MISSING token, an empty production) can sit on a
+ *     sibling's boundary, and ts_node_parent takes a separate path for it too,
+ *     unless the answer needs no containment and came from the walk cursor's
+ *     own chain (`exact_for_empty`);
+ *   - a node below a field target deeper than the path child, where the
+ *     answer depends on the node's own range (usage_unknown). */
+static const CBMUsageFrame *usage_carried_frame(WalkState *state, TSNode node, bool exact_for_empty,
+                                                uint32_t answer) {
+    const CBMUsageFrame *frame = state ? usage_frame_for(state, node) : NULL;
+    if (!frame) {
+        return NULL;
+    }
+    if ((!exact_for_empty && ts_node_start_byte(node) == ts_node_end_byte(node)) ||
+        (frame->context & usage_unknown(answer))) {
+        usage_context_note_fallback(state);
+        return NULL;
+    }
+    /* The O(1) lookup that replaced the climb still counts as classifier work,
+     * which keeps the work floors in the linearity tests meaningful. */
+    usage_field_lookup_test_note_work();
+    return frame;
+}
+
+/* The walk keeps frames for `node` and they give its ts_node_parent chain: for
+ * an empty node (a MISSING token, an empty production) ts_node_parent takes a
+ * path of its own, so that one climbs as before. */
+static const CBMUsageFrame *usage_ancestry_frame(WalkState *state, TSNode node) {
+    const CBMUsageFrame *frame = usage_frame_for(state, node);
+    if (frame && ts_node_start_byte(node) == ts_node_end_byte(node)) {
+        usage_context_note_fallback(state);
+        return NULL;
+    }
+    return frame;
+}
+
+/* The frames index of `owner`: the walk's current node `node` (up 0) or its
+ * ancestor `up` levels above. CBM_USAGE_NO_NEAREST when the caller must climb. */
+static uint32_t usage_walk_level(WalkState *state, TSNode node, uint32_t up, TSNode owner) {
+    if (!usage_ancestry_frame(state, node) || state->usage_context.depth < up) {
+        return CBM_USAGE_NO_NEAREST;
+    }
+    uint32_t level = state->usage_context.depth - up;
+    return ts_node_eq(state->usage_context.frames[level].node, owner) ? level
+                                                                      : CBM_USAGE_NO_NEAREST;
+}
+
+/* ts_node_parent(owner), for an owner that usage_walk_level places, read from
+ * the frames: ts_node_parent descends from the root, O(depth) a call. */
+static TSNode usage_walk_owner_parent(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                      uint32_t up, TSNode owner) {
+    uint32_t level = usage_walk_level(state, node, up, owner);
+    if (level == CBM_USAGE_NO_NEAREST) {
+        usage_slow_parent_fallback_test_note();
+        return ts_node_parent(owner);
+    }
+    usage_field_lookup_test_note_work();
+    TSNode parent = level > 0 ? state->usage_context.frames[level - SKIP_ONE].node : (TSNode){0};
+    if (usage_context_checking(state)) {
+        TSNode climbed = ts_node_parent(owner);
+        usage_context_report(ctx, state, owner, "walk_parent", ts_node_eq(parent, climbed),
+                             ts_node_start_byte(parent), ts_node_start_byte(climbed));
+    }
+    return parent;
+}
+
+/* ts_node_parent(node), read from the frames when node is the walk's current node. */
+static TSNode usage_walk_parent(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    return usage_walk_owner_parent(ctx, state, node, 0, node);
+}
+
+/* ts_node_next_named_sibling(node) given node's parent. The runtime first
+ * finds the parent with ts_node_parent, a descent from the root, then scans the
+ * parent's children for the first named node after `node`, looking through
+ * hidden nodes; this is that scan. It declines (false) for an empty node and
+ * wherever the runtime's scan has rules of its own: an empty node after
+ * `node` (skipped there) or an anonymous node with named children (searched
+ * there). */
+static bool next_named_sibling_below(TSNode parent, TSNode node, TSNode *next) {
+    uint32_t start = ts_node_start_byte(node);
+    if (start == ts_node_end_byte(node)) {
+        return false;
+    }
+    *next = (TSNode){0};
+    bool decided = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
+    if (ts_tree_cursor_goto_first_child_for_byte(&cursor, start) >= 0 &&
+        ts_node_eq(ts_tree_cursor_current_node(&cursor), node)) {
+        decided = true;
+        while (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            TSNode sibling = ts_tree_cursor_current_node(&cursor);
+            bool named = ts_node_is_named(sibling);
+            if (ts_node_start_byte(sibling) == ts_node_end_byte(sibling) ||
+                (!named && ts_node_named_child_count(sibling) > 0)) {
+                decided = false;
+                break;
+            }
+            if (named) {
+                *next = sibling;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return decided;
+}
+
+/* ts_node_next_named_sibling(owner), for an owner that usage_walk_level
+ * places, with its parent from the frames. */
+static TSNode usage_walk_next_named_sibling(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                            uint32_t up, TSNode owner) {
+    uint32_t level = usage_walk_level(state, node, up, owner);
+    TSNode next = {0};
+    if (level == CBM_USAGE_NO_NEAREST || level == 0 ||
+        !next_named_sibling_below(state->usage_context.frames[level - SKIP_ONE].node, owner,
+                                  &next)) {
+        if (level != CBM_USAGE_NO_NEAREST) {
+            usage_context_note_fallback(state);
+        }
+        usage_slow_parent_fallback_test_note();
+        return ts_node_next_named_sibling(owner);
+    }
+    usage_field_lookup_test_note_work();
+    if (usage_context_checking(state)) {
+        TSNode climbed = ts_node_next_named_sibling(owner);
+        usage_context_report(ctx, state, owner, "next_named_sibling", ts_node_eq(next, climbed),
+                             ts_node_start_byte(next), ts_node_start_byte(climbed));
+    }
+    return next;
+}
+
+/* The nearest strict ancestor of node that decides for `slot`, and its frames
+ * level (CBM_USAGE_NO_NEAREST and a null node when none does). False when the
+ * caller must climb: no frames, a slot this walk does not keep, an empty node. */
+static bool usage_nearest(WalkState *state, TSNode node, int slot, TSNode *ancestor,
+                          uint32_t *level) {
+    const CBMUsageFrame *frame = usage_ancestry_frame(state, node);
+    if (!frame || !state->usage_context.nearest_kept[slot]) {
+        return false;
+    }
+    usage_field_lookup_test_note_work();
+    *level = frame->nearest[slot];
+    *ancestor =
+        *level == CBM_USAGE_NO_NEAREST ? (TSNode){0} : state->usage_context.frames[*level].node;
+    return true;
+}
+
+bool cbm_usage_nearest_ancestor(WalkState *state, TSNode node, int slot, TSNode *ancestor) {
+    uint32_t level;
+    return usage_nearest(state, node, slot, ancestor, &level);
+}
+
+bool cbm_usage_context_checking(const WalkState *state) {
+    return usage_context_checking(state);
+}
+
+void cbm_usage_context_verify(CBMExtractCtx *ctx, WalkState *state, TSNode node, const char *answer,
+                              bool carried, bool climbed) {
+    usage_context_verify(ctx, state, node, answer, carried, climbed);
+}
+
+/* An upward walk over node's ts_node_parent chain: from the frames in O(1) a
+ * step when usage_ancestry_frame allows, else by ts_node_parent. */
+typedef struct {
+    const CBMUsageFrame *frames; /* NULL: ts_node_parent */
+    uint32_t level;              /* frames index of the node the walk stands on */
+} CBMUsageAncestors;
+
+static CBMUsageAncestors usage_ancestors(WalkState *state, TSNode node) {
+    CBMUsageAncestors ancestors = {NULL, 0};
+    if (usage_ancestry_frame(state, node)) {
+        ancestors.frames = state->usage_context.frames;
+        ancestors.level = state->usage_context.depth;
+    }
+    return ancestors;
+}
+
+/* The parent of `current`, where the walk stands. */
+static TSNode usage_ancestors_next(CBMUsageAncestors *ancestors, TSNode current) {
+    usage_ancestor_step_test_note();
+    if (!ancestors->frames) {
+        return ts_node_parent(current);
+    }
+    if (ancestors->level == 0) {
+        return (TSNode){0};
+    }
+    ancestors->level--;
+    return ancestors->frames[ancestors->level].node;
+}
+
+/* Start the classifiers' upward walk at `node`, which must be the unified
+ * walk's current node; any other node (and a legacy walk) gets NULL and climbs
+ * with ts_node_parent. The frames hold exactly the path the walk cursor holds,
+ * so stepping them is the cursor climb without first copying the cursor's
+ * O(depth) stack. The copy remains for a walk without frames. There is one
+ * climb per walk, as there was one cursor: starting a climb abandons any other
+ * in progress. */
+static CBMOccurrenceClimb *begin_occurrence_climb(WalkState *state, TSNode node) {
+    if (!state || !state->current_cursor || !state->occurrence_cursor) {
+        return NULL;
+    }
+    CBMOccurrenceClimb *climb = &state->occurrence_climb;
+    if (usage_frame_for(state, node)) {
+        climb->frames = state->usage_context.frames;
+        climb->level = state->usage_context.depth;
+        climb->cursor = NULL;
+        return climb;
+    }
+    if (!ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
+        return NULL;
+    }
+    usage_cursor_copy_test_note(ts_tree_cursor_current_depth(state->current_cursor) + SKIP_ONE);
+    ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
+    climb->frames = NULL;
+    climb->level = 0;
+    climb->cursor = state->occurrence_cursor;
+    return climb;
+}
+
+static const char *usage_field_name(TSNode node, TSFieldId field_id) {
+    return field_id ? ts_language_field_name_for_id(ts_node_language(node), field_id) : NULL;
+}
+
+/* One step up: the parent of `current` and the field `current` occupies in it.
+ * With a climb, `current` must be where the climb stands. */
+static bool occurrence_parent(CBMOccurrenceClimb *climb, TSNode current, TSNode *parent,
                               const char **field) {
-    if (cursor) {
-        *field = ts_tree_cursor_current_field_name(cursor);
+    usage_ancestor_step_test_note();
+    if (climb && climb->frames) {
+        const CBMUsageFrame *frame = &climb->frames[climb->level];
+        *field = usage_field_name(frame->node, frame->field_id);
         usage_field_lookup_test_note_work();
-        if (!ts_tree_cursor_goto_parent(cursor)) {
+        if (climb->level == 0) {
             *parent = (TSNode){0};
             return false;
         }
-        *parent = ts_tree_cursor_current_node(cursor);
+        climb->level--;
+        *parent = climb->frames[climb->level].node;
+        return true;
+    }
+    if (climb) {
+        *field = ts_tree_cursor_current_field_name(climb->cursor);
+        usage_field_lookup_test_note_work();
+        if (!ts_tree_cursor_goto_parent(climb->cursor)) {
+            *parent = (TSNode){0};
+            return false;
+        }
+        *parent = ts_tree_cursor_current_node(climb->cursor);
         return true;
     }
 
@@ -551,32 +958,72 @@ static bool chialisp_head_binds_params_at_2(const char *head) {
                     strcmp(head, "defmacro") == 0 || strcmp(head, "defmac") == 0);
 }
 
-static bool is_lisp_def_binding(CBMExtractCtx *ctx, TSNode node) {
-    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
-    for (TSNode form = ts_node_parent(node); !ts_node_is_null(form); form = ts_node_parent(form)) {
-        const char *kind = ts_node_type(form);
-        if ((strcmp(kind, "list") != 0 && strcmp(kind, "list_lit") != 0) ||
-            ts_node_named_child_count(form) < 2) {
-            continue;
+/* Room for the longest head text a policy compares, plus its terminator. */
+enum { USAGE_HEAD_TEXT_MAX = 32 };
+
+/* node's text as text_equals compares it (a C string: up to any NUL), when it
+ * fits in `size` bytes. No head compared is that long, so longer text is known
+ * not to match without the arena copy text_equals makes -- per ancestor form
+ * of every leaf, that copy grew the arena quadratically on nested forms. */
+static bool usage_short_text(CBMExtractCtx *ctx, TSNode node, char *text, size_t size) {
+    uint32_t end = ts_node_end_byte(node);
+    size_t length = 0;
+    for (uint32_t at = ts_node_start_byte(node); at < end && ctx->source[at] != '\0'; at++) {
+        if (length + SKIP_ONE >= size) {
+            return false;
         }
-        TSNode head_node =
-            chialisp ? cbm_lisp_named_child_skip_comments(form, 0) : ts_node_named_child(form, 0);
-        if (ts_node_is_null(head_node)) {
-            continue;
-        }
-        char *head = cbm_node_text(ctx->arena, head_node, ctx->source);
-        if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_def_head(head))) {
-            continue;
-        }
-        if (node_contains(head_node, node) || named_child_contains(form, 1, node)) {
-            return true;
-        }
-        if ((ctx->language == CBM_LANG_CLOJURE ||
-             (chialisp && chialisp_head_binds_params_at_2(head))) &&
-            ts_node_named_child_count(form) > 2 && named_child_contains(form, 2, node)) {
-            return true;
-        }
+        text[length++] = ctx->source[at];
+    }
+    text[length] = '\0';
+    return true;
+}
+
+/* Named children of a definition form `(head name params ...)`. */
+enum { LISP_DEF_NAME = 1, LISP_DEF_PARAMS = 2 };
+
+static TSNode lisp_def_head_node(CBMExtractCtx *ctx, TSNode form) {
+    return ctx->language == CBM_LANG_CHIALISP ? cbm_lisp_named_child_skip_comments(form, 0)
+                                              : ts_node_named_child(form, 0);
+}
+
+/* A form is_lisp_def_binding stops at: a list whose head names a definition. */
+static bool lisp_def_form(CBMExtractCtx *ctx, TSNode form) {
+    const char *kind = ts_node_type(form);
+    if ((strcmp(kind, "list") != 0 && strcmp(kind, "list_lit") != 0) ||
+        ts_node_named_child_count(form) <= LISP_DEF_NAME) {
         return false;
+    }
+    TSNode head_node = lisp_def_head_node(ctx, form);
+    char head[USAGE_HEAD_TEXT_MAX];
+    if (ts_node_is_null(head_node) || !usage_short_text(ctx, head_node, head, sizeof(head))) {
+        return false;
+    }
+    return ctx->language == CBM_LANG_CHIALISP ? cbm_chialisp_is_def_head(head)
+                                              : lisp_def_head(head);
+}
+
+/* The definition form binds its head, its second form, and in Clojure (or
+ * under a Chialisp head with parameters third) its third form. */
+static bool lisp_def_form_binds(CBMExtractCtx *ctx, TSNode form, TSNode node) {
+    TSNode head_node = lisp_def_head_node(ctx, form);
+    if (node_contains(head_node, node) || named_child_contains(form, LISP_DEF_NAME, node)) {
+        return true;
+    }
+    char head[USAGE_HEAD_TEXT_MAX];
+    bool third_binds = ctx->language == CBM_LANG_CLOJURE ||
+                       (ctx->language == CBM_LANG_CHIALISP &&
+                        usage_short_text(ctx, head_node, head, sizeof(head)) &&
+                        chialisp_head_binds_params_at_2(head));
+    return third_binds && ts_node_named_child_count(form) > LISP_DEF_PARAMS &&
+           named_child_contains(form, LISP_DEF_PARAMS, node);
+}
+
+static bool is_lisp_def_binding(CBMExtractCtx *ctx, TSNode node) {
+    for (TSNode form = ts_node_parent(node); !ts_node_is_null(form); form = ts_node_parent(form)) {
+        usage_ancestor_step_test_note();
+        if (lisp_def_form(ctx, form)) {
+            return lisp_def_form_binds(ctx, form, node);
+        }
     }
     return false;
 }
@@ -600,24 +1047,38 @@ static bool is_fennel_fn_binding(CBMExtractCtx *ctx, TSNode node) {
     return false;
 }
 
+/* The named child of a definition call `def name(args)` after its head. */
+enum { ELIXIR_DEF_ARGUMENTS = 1 };
+
+/* A form is_elixir_def_binding stops at: a def, defp or defmacro call. */
+static bool elixir_def_form(CBMExtractCtx *ctx, TSNode form) {
+    if (strcmp(ts_node_type(form), "call") != 0 ||
+        ts_node_named_child_count(form) <= ELIXIR_DEF_ARGUMENTS) {
+        return false;
+    }
+    char head[USAGE_HEAD_TEXT_MAX];
+    return usage_short_text(ctx, ts_node_named_child(form, 0), head, sizeof(head)) &&
+           (strcmp(head, "def") == 0 || strcmp(head, "defp") == 0 || strcmp(head, "defmacro") == 0);
+}
+
+/* The definition binds its head and its signature, not its body. */
+static bool elixir_def_form_binds(TSNode form, TSNode node) {
+    TSNode head = ts_node_named_child(form, 0);
+    TSNode arguments = ts_node_child_by_field_name(form, TS_FIELD("arguments"));
+    if (ts_node_is_null(arguments) || ts_node_named_child_count(arguments) == 0) {
+        arguments = ts_node_named_child(form, ELIXIR_DEF_ARGUMENTS);
+    }
+    TSNode signature =
+        ts_node_named_child_count(arguments) > 0 ? ts_node_named_child(arguments, 0) : arguments;
+    return node_contains(head, node) || node_contains(signature, node);
+}
+
 static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
     for (TSNode form = ts_node_parent(node); !ts_node_is_null(form); form = ts_node_parent(form)) {
-        if (strcmp(ts_node_type(form), "call") != 0 || ts_node_named_child_count(form) < 2) {
-            continue;
+        usage_ancestor_step_test_note();
+        if (elixir_def_form(ctx, form)) {
+            return elixir_def_form_binds(form, node);
         }
-        TSNode head = ts_node_named_child(form, 0);
-        if (!text_equals(ctx, head, "def") && !text_equals(ctx, head, "defp") &&
-            !text_equals(ctx, head, "defmacro")) {
-            continue;
-        }
-        TSNode arguments = ts_node_child_by_field_name(form, TS_FIELD("arguments"));
-        if (ts_node_is_null(arguments) || ts_node_named_child_count(arguments) == 0) {
-            arguments = ts_node_named_child(form, 1);
-        }
-        TSNode signature = ts_node_named_child_count(arguments) > 0
-                               ? ts_node_named_child(arguments, 0)
-                               : arguments;
-        return node_contains(head, node) || node_contains(signature, node);
     }
     return false;
 }
@@ -625,6 +1086,7 @@ static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
 static bool is_first_named_part_of(TSNode node, const char *container_kind) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (strcmp(ts_node_type(parent), container_kind) == 0) {
             return named_child_contains(parent, 0, node);
         }
@@ -649,40 +1111,54 @@ static bool is_wolfram_lhs(TSNode node) {
 
 static bool any_field_contains_node(TSNode parent, const char *field, TSNode node);
 
+/* A binder is_tlaplus_binding stops at. */
+static bool tlaplus_binder_form(TSNode node) {
+    const char *kind = ts_node_type(node);
+    return strcmp(kind, "operator_definition") == 0 || strcmp(kind, "function_definition") == 0 ||
+           strcmp(kind, "bounded_quantification") == 0 ||
+           strcmp(kind, "unbounded_quantification") == 0;
+}
+
+/* Does the binder bind node? `bound` is the nearest quantifier_bound strictly
+ * between them (null if none), which decides under a function definition or a
+ * bounded quantification. */
+static bool tlaplus_binder_binds(TSNode binder, TSNode bound, TSNode node) {
+    const char *kind = ts_node_type(binder);
+    if (strcmp(kind, "operator_definition") == 0) {
+        /* `name:` is the callable declaration, while every repeated
+         * `parameter:` field is a function-wide lexical binder. */
+        return any_field_contains_node(binder, "parameter", node);
+    }
+    if (strcmp(kind, "unbounded_quantification") == 0) {
+        return any_field_contains_node(binder, "intro", node);
+    }
+    /* `F[x \in S] == ...`: only quantifier_bound.intro binds. The set
+     * expression S remains an ordinary identifier_ref usage. */
+    return !ts_node_is_null(bound) && any_field_contains_node(bound, "intro", node);
+}
+
 static bool is_tlaplus_binding(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
+        if (!tlaplus_binder_form(parent)) {
+            continue;
+        }
+        TSNode bound = {0};
         const char *kind = ts_node_type(parent);
-        if (strcmp(kind, "operator_definition") == 0) {
-            /* `name:` is the callable declaration, while every repeated
-             * `parameter:` field is a function-wide lexical binder. */
-            return any_field_contains_node(parent, "parameter", node);
-        }
-        if (strcmp(kind, "function_definition") == 0) {
-            /* `F[x \in S] == ...`: only quantifier_bound.intro binds. The set
-             * expression S remains an ordinary identifier_ref usage. */
-            for (TSNode bound = ts_node_parent(node);
-                 !ts_node_is_null(bound) && !ts_node_eq(bound, parent);
-                 bound = ts_node_parent(bound)) {
-                if (strcmp(ts_node_type(bound), "quantifier_bound") == 0) {
-                    return any_field_contains_node(bound, "intro", node);
+        if (strcmp(kind, "function_definition") == 0 ||
+            strcmp(kind, "bounded_quantification") == 0) {
+            for (TSNode above = ts_node_parent(node);
+                 !ts_node_is_null(above) && !ts_node_eq(above, parent);
+                 above = ts_node_parent(above)) {
+                usage_ancestor_step_test_note();
+                if (strcmp(ts_node_type(above), "quantifier_bound") == 0) {
+                    bound = above;
+                    break;
                 }
             }
-            return false;
         }
-        if (strcmp(kind, "bounded_quantification") == 0) {
-            for (TSNode bound = ts_node_parent(node);
-                 !ts_node_is_null(bound) && !ts_node_eq(bound, parent);
-                 bound = ts_node_parent(bound)) {
-                if (strcmp(ts_node_type(bound), "quantifier_bound") == 0) {
-                    return any_field_contains_node(bound, "intro", node);
-                }
-            }
-            return false;
-        }
-        if (strcmp(kind, "unbounded_quantification") == 0) {
-            return any_field_contains_node(parent, "intro", node);
-        }
+        return tlaplus_binder_binds(parent, bound, node);
     }
     return false;
 }
@@ -953,14 +1429,20 @@ static bool is_teal_function_binding(TSNode node) {
     return false;
 }
 
+/* The defun_header binds the function's name and its lambda list. */
+static bool commonlisp_defun_header_binds(TSNode header, TSNode node) {
+    return field_contains_node(header, "function_name", node) ||
+           field_contains_node(header, "lambda_list", node);
+}
+
 static bool is_commonlisp_defun_binding(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (strcmp(ts_node_type(parent), "defun_header") != 0) {
             continue;
         }
-        return field_contains_node(parent, "function_name", node) ||
-               field_contains_node(parent, "lambda_list", node);
+        return commonlisp_defun_header_binds(parent, node);
     }
     return false;
 }
@@ -1032,8 +1514,9 @@ static bool is_pkl_declaration_binding(TSNode node) {
     return false;
 }
 
-static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
-                              const CBMOccurrenceSpec *occurrence) {
+/* The language's binding policy, by climbing from `node`. */
+static bool policy_binding_climb(CBMExtractCtx *ctx, TSNode node,
+                                 const CBMOccurrenceSpec *occurrence) {
     switch (occurrence->policy) {
     case CBM_OCCURRENCE_LISP_DEF:
         return is_lisp_def_binding(ctx, node);
@@ -1104,6 +1587,128 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
     }
 }
 
+/* Most policies climb to the NEAREST ancestor of some description and decide
+ * there. The walk keeps that ancestor on its frames (CBM_USAGE_NEAREST_POLICY,
+ * and _POLICY_AUX for a policy's second search), so the climbs below become a
+ * lookup; each still decides at its ancestor with its own code. Every named
+ * leaf asks, twice, so a nested chain of forms made the climb O(depth) root
+ * descents per leaf: cubic overall. */
+
+/* The container is_first_named_part_of looks for under `policy` (Nickel's
+ * first of two), or NULL. */
+static const char *policy_first_named_part_kind(CBMOccurrencePolicy policy) {
+    switch (policy) {
+    case CBM_OCCURRENCE_JULIA_FUNCTION:
+        return "function_definition";
+    case CBM_OCCURRENCE_TYPST_LET:
+        return "let";
+    case CBM_OCCURRENCE_ELM_VALUE:
+        return "value_declaration";
+    case CBM_OCCURRENCE_RESCRIPT_LET:
+    case CBM_OCCURRENCE_NICKEL_LET:
+        return "let_binding";
+    case CBM_OCCURRENCE_PURESCRIPT_LHS:
+        return "function";
+    default:
+        return NULL;
+    }
+}
+
+/* Where the policy's climb stops (CBM_USAGE_NEAREST_POLICY). */
+static bool policy_ancestor_decides(CBMExtractCtx *ctx, TSNode ancestor) {
+    CBMOccurrencePolicy policy = occurrence_specs[ctx->language].policy;
+    switch (policy) {
+    case CBM_OCCURRENCE_LISP_DEF:
+        return lisp_def_form(ctx, ancestor);
+    case CBM_OCCURRENCE_COMMONLISP_DEFUN:
+        return strcmp(ts_node_type(ancestor), "defun_header") == 0;
+    case CBM_OCCURRENCE_ELIXIR_DEF:
+        return elixir_def_form(ctx, ancestor);
+    case CBM_OCCURRENCE_TLAPLUS_OPERATOR:
+        return tlaplus_binder_form(ancestor);
+    default: {
+        const char *kind = policy_first_named_part_kind(policy);
+        return kind && strcmp(ts_node_type(ancestor), kind) == 0;
+    }
+    }
+}
+
+/* The policy's second search (CBM_USAGE_NEAREST_POLICY_AUX): the quantifier
+ * bound under a TLA+ binder, Nickel's pattern_fun. */
+static bool policy_aux_ancestor_decides(CBMExtractCtx *ctx, TSNode ancestor) {
+    switch (occurrence_specs[ctx->language].policy) {
+    case CBM_OCCURRENCE_TLAPLUS_OPERATOR:
+        return strcmp(ts_node_type(ancestor), "quantifier_bound") == 0;
+    case CBM_OCCURRENCE_NICKEL_LET:
+        return strcmp(ts_node_type(ancestor), "pattern_fun") == 0;
+    default:
+        return false;
+    }
+}
+
+/* Does is_policy_binding read CBM_USAGE_NEAREST_POLICY under `policy`? */
+static bool policy_uses_nearest(CBMOccurrencePolicy policy) {
+    switch (policy) {
+    case CBM_OCCURRENCE_LISP_DEF:
+    case CBM_OCCURRENCE_COMMONLISP_DEFUN:
+    case CBM_OCCURRENCE_ELIXIR_DEF:
+    case CBM_OCCURRENCE_TLAPLUS_OPERATOR:
+        return true;
+    default:
+        return policy_first_named_part_kind(policy) != NULL;
+    }
+}
+
+/* The policy's answer for node at the nearest deciding ancestor (at frames
+ * `level`) and the nearest ancestor of its second search (at `aux_level`). */
+static bool policy_binding_at(CBMExtractCtx *ctx, TSNode node, TSNode ancestor, uint32_t level,
+                              TSNode aux, uint32_t aux_level) {
+    CBMOccurrencePolicy policy = occurrence_specs[ctx->language].policy;
+    if (policy == CBM_OCCURRENCE_NICKEL_LET && !ts_node_is_null(aux) &&
+        named_child_contains(aux, 0, node)) {
+        return true;
+    }
+    if (ts_node_is_null(ancestor)) {
+        return false;
+    }
+    switch (policy) {
+    case CBM_OCCURRENCE_LISP_DEF:
+        return lisp_def_form_binds(ctx, ancestor, node);
+    case CBM_OCCURRENCE_COMMONLISP_DEFUN:
+        return commonlisp_defun_header_binds(ancestor, node);
+    case CBM_OCCURRENCE_ELIXIR_DEF:
+        return elixir_def_form_binds(ancestor, node);
+    case CBM_OCCURRENCE_TLAPLUS_OPERATOR:
+        /* Only a quantifier bound strictly below the binder counts. */
+        return tlaplus_binder_binds(
+            ancestor, aux_level != CBM_USAGE_NO_NEAREST && aux_level > level ? aux : (TSNode){0},
+            node);
+    default:
+        return named_child_contains(ancestor, 0, node);
+    }
+}
+
+static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node, const CBMOccurrenceSpec *occurrence,
+                              WalkState *state) {
+    TSNode ancestor;
+    uint32_t level;
+    if (!usage_nearest(state, node, CBM_USAGE_NEAREST_POLICY, &ancestor, &level)) {
+        return policy_binding_climb(ctx, node, occurrence);
+    }
+    TSNode aux = {0};
+    uint32_t aux_level = CBM_USAGE_NO_NEAREST;
+    if (!usage_nearest(state, node, CBM_USAGE_NEAREST_POLICY_AUX, &aux, &aux_level)) {
+        aux = (TSNode){0};
+        aux_level = CBM_USAGE_NO_NEAREST;
+    }
+    bool carried = policy_binding_at(ctx, node, ancestor, level, aux, aux_level);
+    if (usage_context_checking(state)) {
+        usage_context_verify(ctx, state, node, "policy_binding", carried,
+                             policy_binding_climb(ctx, node, occurrence));
+    }
+    return carried;
+}
+
 static bool elixir_binary_operator_binds(CBMExtractCtx *ctx, TSNode node) {
     if (ctx->language != CBM_LANG_ELIXIR || strcmp(ts_node_type(node), "binary_operator") != 0) {
         return false;
@@ -1113,22 +1718,33 @@ static bool elixir_binary_operator_binds(CBMExtractCtx *ctx, TSNode node) {
            text_equals(ctx, operator_node, "->") || text_equals(ctx, operator_node, "\\\\");
 }
 
-static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                                  WalkState *state) {
-    const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
-    if (is_exact_language_binding(ctx, node, state)) {
-        return true;
+/* A declaration whose binding fields bind (standard_binding_climb). Elixir's
+ * binary_operator binds by its operator text instead of by the variable kinds. */
+static bool binding_declared_container(CBMExtractCtx *ctx, const CBMLangSpec *spec, TSNode parent,
+                                       const char *kind) {
+    bool variable_container =
+        spec->variable_node_types && cbm_kind_in_set(parent, spec->variable_node_types);
+    if (ctx->language == CBM_LANG_ELIXIR && strcmp(kind, "binary_operator") == 0) {
+        variable_container = elixir_binary_operator_binds(ctx, parent);
     }
-    if (is_policy_binding(ctx, node, occurrence)) {
-        return true;
-    }
+    return kind_in_exact_set(kind, field_binding_nodes) ||
+           (spec->function_node_types && cbm_kind_in_set(parent, spec->function_node_types)) ||
+           (spec->class_node_types && cbm_kind_in_set(parent, spec->class_node_types)) ||
+           (spec->field_node_types && cbm_kind_in_set(parent, spec->field_node_types)) ||
+           variable_container;
+}
 
+/* The standard binding rules, by climbing from `node`: the nearest ancestor
+ * that decides, decides. The walk carries the same answer down
+ * (CBM_USAGE_CONTEXT_BINDING); this climb answers when it cannot. */
+static bool standard_binding_climb(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                   CBMOccurrenceClimb *climb) {
+    const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     TSNode current = node;
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field)) {
+        if (!occurrence_parent(climb, current, &parent, &field)) {
             break;
         }
         if (is_value_field(field)) {
@@ -1158,18 +1774,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
             return true;
         }
 
-        bool variable_container =
-            spec->variable_node_types && cbm_kind_in_set(parent, spec->variable_node_types);
-        if (ctx->language == CBM_LANG_ELIXIR && strcmp(kind, "binary_operator") == 0) {
-            variable_container = elixir_binary_operator_binds(ctx, parent);
-        }
-        bool declared_container =
-            kind_in_exact_set(kind, field_binding_nodes) ||
-            (spec->function_node_types && cbm_kind_in_set(parent, spec->function_node_types)) ||
-            (spec->class_node_types && cbm_kind_in_set(parent, spec->class_node_types)) ||
-            (spec->field_node_types && cbm_kind_in_set(parent, spec->field_node_types)) ||
-            variable_container;
-        if (declared_container) {
+        if (binding_declared_container(ctx, spec, parent, kind)) {
             for (const char *const *binding_field = binding_fields; *binding_field;
                  binding_field++) {
                 if (field_contains_node(parent, *binding_field, node)) {
@@ -1180,6 +1785,29 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         current = parent;
     }
     return false;
+}
+
+static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                  WalkState *state) {
+    const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
+    if (is_exact_language_binding(ctx, node, state)) {
+        return true;
+    }
+    if (is_policy_binding(ctx, node, occurrence, state)) {
+        return true;
+    }
+    const CBMUsageFrame *frame = usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_BINDING);
+    if (!frame) {
+        return standard_binding_climb(ctx, node, spec, begin_occurrence_climb(state, node));
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_BINDING) != 0;
+    if (usage_context_checking(state)) {
+        state->usage_context.climb_only = true;
+        bool climbed = standard_binding_climb(ctx, node, spec, begin_occurrence_climb(state, node));
+        state->usage_context.climb_only = false;
+        usage_context_verify(ctx, state, node, "binding", carried, climbed);
+    }
+    return carried;
 }
 
 static bool assignment_reads_target(TSNode assignment) {
@@ -1220,15 +1848,16 @@ static bool assignment_reads_target(TSNode assignment) {
     return false;
 }
 
-static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                                WalkState *state) {
+/* Assignment-target rules, by climbing from `node`. Carried down as
+ * CBM_USAGE_CONTEXT_WRITE. */
+static bool write_climb(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                        CBMOccurrenceClimb *climb) {
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     TSNode current = node;
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field)) {
+        if (!occurrence_parent(climb, current, &parent, &field)) {
             break;
         }
         if (is_value_field(field)) {
@@ -1265,6 +1894,22 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     return false;
 }
 
+static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                WalkState *state) {
+    const CBMUsageFrame *frame = usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_WRITE);
+    if (!frame) {
+        return write_climb(ctx, node, spec, begin_occurrence_climb(state, node));
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_WRITE) != 0;
+    if (usage_context_checking(state)) {
+        state->usage_context.climb_only = true;
+        bool climbed = write_climb(ctx, node, spec, begin_occurrence_climb(state, node));
+        state->usage_context.climb_only = false;
+        usage_context_verify(ctx, state, node, "write", carried, climbed);
+    }
+    return carried;
+}
+
 static bool is_argument_container_kind(const char *kind) {
     return kind && (strcmp(kind, "arguments") == 0 || strcmp(kind, "argument_list") == 0 ||
                     strcmp(kind, "value_arguments") == 0);
@@ -1299,16 +1944,19 @@ static bool is_call_argument_label(TSNode node) {
     return false;
 }
 
-static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
-    if (!cursor)
+/* Carried down as CBM_USAGE_CONTEXT_ARGUMENT_LABEL. Edge fields and kinds only,
+ * no containment, so the carried answer holds for empty nodes too. */
+static bool call_argument_label_climb(TSNode node, CBMOccurrenceClimb *climb) {
+    if (!climb) {
         return is_call_argument_label(node);
+    }
     TSNode current = node;
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field))
+        if (!occurrence_parent(climb, current, &parent, &field)) {
             return false;
+        }
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
             return field && (strcmp(field, "name") == 0 || strcmp(field, "label") == 0 ||
@@ -1319,6 +1967,22 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
         current = parent;
     }
     return false;
+}
+
+static bool is_call_argument_label_walk(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    const CBMUsageFrame *frame =
+        usage_carried_frame(state, node, true, CBM_USAGE_CONTEXT_ARGUMENT_LABEL);
+    if (!frame) {
+        return call_argument_label_climb(node, begin_occurrence_climb(state, node));
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_ARGUMENT_LABEL) != 0;
+    if (usage_context_checking(state)) {
+        state->usage_context.climb_only = true;
+        bool climbed = call_argument_label_climb(node, begin_occurrence_climb(state, node));
+        state->usage_context.climb_only = false;
+        usage_context_verify(ctx, state, node, "argument_label", carried, climbed);
+    }
+    return carried;
 }
 
 static bool is_direct_argument_value(TSNode node) {
@@ -1356,19 +2020,21 @@ static bool is_direct_argument_value(TSNode node) {
 }
 
 /* The body of the walk above, entered one level in: for a caller that has
- * ALREADY stepped the cursor onto `parent` and knows which `field` of it the
+ * ALREADY stepped its climb onto `parent` and knows which `field` of it the
  * node below occupies. A caller that climbed to find its site has that pair in
- * hand, and re-deriving it would mean either stepping the cursor twice or
- * paying ts_node_parent for what the cursor just told us. */
-static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTreeCursor *cursor) {
+ * hand, and re-deriving it would mean either stepping the climb twice or
+ * paying ts_node_parent for what the climb just told us. */
+static bool is_direct_argument_value_from(TSNode parent, const char *field,
+                                          CBMOccurrenceClimb *climb) {
     for (;;) {
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
             if (!field || strcmp(field, "value") != 0)
                 return false;
             /* The labeled argument now has to be the argument value itself. */
-            if (!occurrence_parent(cursor, parent, &parent, &field))
+            if (!occurrence_parent(climb, parent, &parent, &field)) {
                 return false;
+            }
             continue;
         }
         if (field && strcmp(field, "arguments") == 0)
@@ -1378,7 +2044,7 @@ static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTr
         if (strcmp(parent_kind, "list_expression") == 0) {
             TSNode call;
             const char *list_field;
-            return occurrence_parent(cursor, parent, &call, &list_field) && list_field &&
+            return occurrence_parent(climb, parent, &call, &list_field) && list_field &&
                    strcmp(list_field, "arguments") == 0;
         }
         if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
@@ -1386,24 +2052,35 @@ static bool is_direct_argument_value_from(TSNode parent, const char *field, TSTr
         }
         TSNode grandparent;
         const char *argument_field;
-        return occurrence_parent(cursor, parent, &grandparent, &argument_field) &&
+        return occurrence_parent(climb, parent, &grandparent, &argument_field) &&
                is_argument_container_kind(ts_node_type(grandparent));
     }
 }
 
-/* Cursor-backed counterpart for the unified walker. `cursor` must currently
- * point at `node`; it is consumed while walking toward the argument owner. */
-static bool is_direct_argument_value_cursor(TSNode node, TSTreeCursor *cursor) {
+/* Climb-backed counterpart for the unified walker. `climb` must currently
+ * stand at `node`; it is consumed while walking toward the argument owner. */
+static bool is_direct_argument_value_climb(TSNode node, CBMOccurrenceClimb *climb) {
     TSNode parent;
     const char *field;
-    if (!occurrence_parent(cursor, node, &parent, &field))
+    if (!occurrence_parent(climb, node, &parent, &field)) {
         return false;
-    return is_direct_argument_value_from(parent, field, cursor);
+    }
+    return is_direct_argument_value_from(parent, field, climb);
 }
 
 static bool is_direct_argument_value_walk(TSNode node, WalkState *state) {
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
-    return cursor ? is_direct_argument_value_cursor(node, cursor) : is_direct_argument_value(node);
+    CBMOccurrenceClimb *climb = begin_occurrence_climb(state, node);
+    return climb ? is_direct_argument_value_climb(node, climb) : is_direct_argument_value(node);
+}
+
+/* The parenthesized_expression holds exactly `site`: in its expression field,
+ * or as its only named child where the grammar gives no field. */
+static bool python_parentheses_wrap(TSNode parenthesized, TSNode site) {
+    TSNode inner = ts_node_child_by_field_name(parenthesized, TS_FIELD("expression"));
+    if (ts_node_is_null(inner) && ts_node_named_child_count(parenthesized) == SKIP_ONE) {
+        inner = ts_node_named_child(parenthesized, 0);
+    }
+    return !ts_node_is_null(inner) && ts_node_eq(inner, site);
 }
 
 static TSNode python_direct_callable_attribute_site(TSNode node) {
@@ -1415,17 +2092,62 @@ static TSNode python_direct_callable_attribute_site(TSNode node) {
     TSNode parent = ts_node_parent(site);
     while (!ts_node_is_null(parent) &&
            strcmp(ts_node_type(parent), "parenthesized_expression") == 0) {
-        TSNode inner = ts_node_child_by_field_name(parent, TS_FIELD("expression"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(parent) == 1) {
-            inner = ts_node_named_child(parent, 0);
-        }
-        if (ts_node_is_null(inner) || !ts_node_eq(inner, site)) {
+        if (!python_parentheses_wrap(parent, site)) {
             return (TSNode){0};
         }
         site = parent;
         parent = ts_node_parent(site);
     }
     return is_direct_argument_value(site) ? site : (TSNode){0};
+}
+
+/* The same site walk on a climb over the frames that stands at the attribute
+ * `node`. The ts_node_parent version pays a root descent per step, and every
+ * attribute of a chain `a.b.b...` asks: O(depth) per node, quadratic overall. */
+static TSNode python_direct_callable_attribute_site_climb(TSNode node, CBMOccurrenceClimb *climb) {
+    if (strcmp(ts_node_type(node), "attribute") != 0) {
+        return (TSNode){0};
+    }
+    TSNode site = node;
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(climb, site, &parent, &field)) {
+        return (TSNode){0};
+    }
+    while (strcmp(ts_node_type(parent), "parenthesized_expression") == 0) {
+        if (!python_parentheses_wrap(parent, site)) {
+            return (TSNode){0};
+        }
+        site = parent;
+        if (!occurrence_parent(climb, site, &parent, &field)) {
+            return (TSNode){0};
+        }
+    }
+    return is_direct_argument_value_from(parent, field, climb) ? site : (TSNode){0};
+}
+
+/* The site walk from the attribute a climb has just stepped onto. */
+static TSNode python_direct_callable_attribute_site_from(TSNode attribute,
+                                                         CBMOccurrenceClimb *climb) {
+    /* An empty attribute and a climb on a cursor copy take the old walk. */
+    return climb && climb->frames && ts_node_start_byte(attribute) < ts_node_end_byte(attribute)
+               ? python_direct_callable_attribute_site_climb(attribute, climb)
+               : python_direct_callable_attribute_site(attribute);
+}
+
+/* python_direct_callable_attribute_site for the walk's current node. */
+static TSNode python_attribute_site_walk(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    if (!usage_ancestry_frame(state, node)) {
+        return python_direct_callable_attribute_site(node);
+    }
+    TSNode site =
+        python_direct_callable_attribute_site_climb(node, begin_occurrence_climb(state, node));
+    if (usage_context_checking(state)) {
+        TSNode climbed = python_direct_callable_attribute_site(node);
+        usage_context_report(ctx, state, node, "python_attribute_site", ts_node_eq(site, climbed),
+                             ts_node_start_byte(site), ts_node_start_byte(climbed));
+    }
+    return site;
 }
 
 static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage language) {
@@ -1452,7 +2174,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
  * arguments are narrow syntactic candidates only. A language LSP must still
  * prove one target at this exact occurrence before the graph upgrades USAGE to
  * CALL_REFERENCE; unresolved, reassigned, and composite expressions stay USAGE. */
-/* One step up from `site`, on the walk cursor when the caller has one. Every
+/* One step up from `site`, on the caller's climb when it has one. Every
  * other language branch in call_reference_candidate_site climbs this way; C#
  * used ts_node_parent, which tree-sitter answers by descending from the ROOT,
  * so each step costs O(depth) with a child scan at every level. On the
@@ -1462,23 +2184,23 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
  * ts_node_child_with_descendant). Those files are also the ones the old CPU
  * deadline used to cut off mid-walk, so the slow path and the nondeterminism
  * it forced were the same defect seen from two ends. */
-static bool csharp_site_parent(TSTreeCursor *cursor, TSNode site, TSNode *parent,
+static bool csharp_site_parent(CBMOccurrenceClimb *climb, TSNode site, TSNode *parent,
                                const char **field) {
-    if (!cursor) {
+    if (!climb) {
         usage_slow_parent_fallback_test_note();
     }
-    return occurrence_parent(cursor, site, parent, field);
+    return occurrence_parent(climb, site, parent, field);
 }
 
 static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char *parent_field,
-                                         TSTreeCursor *cursor) {
+                                         CBMOccurrenceClimb *climb) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
     }
 
     /* The caller has already resolved node's parent (and the field it occupies)
-     * with the cursor, so the climb starts from that pair instead of asking for
+     * on its climb, so the climb starts from that pair instead of asking for
      * it again. Invariant below: `parent`/`field` always describe `site`. */
     TSNode site = node;
     const char *field = parent_field;
@@ -1491,7 +2213,7 @@ static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char 
             return (TSNode){0};
         }
         site = parent;
-        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+        if (!csharp_site_parent(climb, site, &parent, &field)) {
             return (TSNode){0};
         }
     }
@@ -1502,7 +2224,7 @@ static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char 
             return (TSNode){0};
         }
         site = parent;
-        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+        if (!csharp_site_parent(climb, site, &parent, &field)) {
             return (TSNode){0};
         }
     }
@@ -1517,7 +2239,7 @@ static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char 
             return (TSNode){0};
         }
         site = parent;
-        if (!csharp_site_parent(cursor, site, &parent, &field)) {
+        if (!csharp_site_parent(climb, site, &parent, &field)) {
             return (TSNode){0};
         }
     }
@@ -1527,15 +2249,15 @@ static TSNode csharp_callable_value_site(TSNode node, TSNode parent, const char 
     if (ts_node_is_null(parent)) {
         return (TSNode){0};
     }
-    return is_direct_argument_value_from(parent, field, cursor) ? node : (TSNode){0};
+    return is_direct_argument_value_from(parent, field, climb) ? node : (TSNode){0};
 }
 
 /* Climb out of the parentheses wrapping a direct argument and return the
  * outermost wrapper, or null when the node is not a parenthesised direct
  * argument. Mirrors python_direct_callable_attribute_site so the bare
  * identifier and bound method forms agree on one occurrence. */
-static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent, TSTreeCursor *cursor,
-                                                 WalkState *state) {
+static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent,
+                                                 CBMOccurrenceClimb *climb, WalkState *state) {
     /* The caller already resolved `parent`; checking its kind first keeps the
      * common case (an identifier that is not parenthesised at all) free of any
      * extra parent resolution. Walking up with ts_node_parent here instead
@@ -1557,8 +2279,8 @@ static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent, TST
         site = wrapper;
         TSNode next = {0};
         const char *field = NULL;
-        if (cursor) {
-            if (!occurrence_parent(cursor, site, &next, &field)) {
+        if (climb) {
+            if (!occurrence_parent(climb, site, &next, &field)) {
                 next = (TSNode){0};
             }
         } else {
@@ -1579,17 +2301,17 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         return (TSNode){0};
     }
     const char *kind = ts_node_type(node);
-    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    CBMOccurrenceClimb *climb = begin_occurrence_climb(state, node);
     TSNode parent = {0};
     const char *parent_field = NULL;
-    if (!cursor) {
+    if (!climb) {
         usage_slow_parent_fallback_test_note();
     }
     /* Resolve the parent AND the field node occupies in it, on both paths. The
      * C# site walk below carries that field into the argument test, and
      * ts_node_parent on its own would leave it NULL there — silently losing the
-     * "this node IS the arguments" case whenever no cursor is available. */
-    (void)occurrence_parent(cursor, node, &parent, &parent_field);
+     * "this node IS the arguments" case whenever no climb is available. */
+    (void)occurrence_parent(climb, node, &parent, &parent_field);
     bool ts_family = ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS;
     if (ts_family && strcmp(kind, "property_identifier") == 0 && !ts_node_is_null(parent) &&
@@ -1597,8 +2319,8 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
         TSNode arguments = {0};
         const char *member_field = NULL;
-        if (cursor) {
-            (void)occurrence_parent(cursor, parent, &arguments, &member_field);
+        if (climb) {
+            (void)occurrence_parent(climb, parent, &arguments, &member_field);
         } else {
             usage_slow_parent_fallback_test_note();
             arguments = ts_node_parent(parent);
@@ -1613,15 +2335,15 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "attribute") == 0) {
         TSNode attribute = ts_node_child_by_field_name(parent, TS_FIELD("attribute"));
         return !ts_node_is_null(attribute) && ts_node_eq(attribute, node)
-                   ? python_direct_callable_attribute_site(parent)
+                   ? python_direct_callable_attribute_site_from(parent, climb)
                    : (TSNode){0};
     }
     if (ctx->language == CBM_LANG_GO && strcmp(kind, "field_identifier") == 0 &&
         !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "selector_expression") == 0) {
         TSNode field = ts_node_child_by_field_name(parent, TS_FIELD("field"));
         return !ts_node_is_null(field) && ts_node_eq(field, node) &&
-                       (cursor ? is_direct_argument_value_cursor(parent, cursor)
-                               : is_direct_argument_value(parent))
+                       (climb ? is_direct_argument_value_climb(parent, climb)
+                              : is_direct_argument_value(parent))
                    ? parent
                    : (TSNode){0};
     }
@@ -1629,7 +2351,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         return is_direct_argument_value_walk(node, state) ? node : (TSNode){0};
     }
     if (ctx->language == CBM_LANG_CSHARP) {
-        return csharp_callable_value_site(node, parent, parent_field, cursor);
+        return csharp_callable_value_site(node, parent, parent_field, climb);
     }
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
@@ -1665,7 +2387,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
      * previously stopped at the parentheses and became no candidate at all, so
      * the occurrence-exact join had nothing to join and a parenthesised
      * callable argument produced no reference. */
-    return paren_wrapped_direct_argument_site(node, parent, cursor, state);
+    return paren_wrapped_direct_argument_site(node, parent, climb, state);
 }
 
 static char *reference_name(CBMExtractCtx *ctx, TSNode node) {
@@ -1728,6 +2450,16 @@ static const char *lexical_binding_key(CBMExtractCtx *ctx, WalkState *state, con
 static void stamp_usage_site(CBMExtractCtx *ctx, CBMUsage *usage, TSNode node, const char *name,
                              WalkState *state) {
     TSNode candidate_site = call_reference_candidate_site(ctx, node, name, state);
+    if (usage_context_checking(state) && usage_frame_for(state, node)) {
+        /* The site walk stepped the frames; the reference copies the cursor. */
+        state->usage_context.climb_only = true;
+        TSNode climbed = call_reference_candidate_site(ctx, node, name, state);
+        state->usage_context.climb_only = false;
+        usage_context_report(ctx, state, node, "call_reference_site",
+                             ts_node_eq(candidate_site, climbed) ||
+                                 (ts_node_is_null(candidate_site) && ts_node_is_null(climbed)),
+                             ts_node_start_byte(candidate_site), ts_node_start_byte(climbed));
+    }
     TSNode site = ts_node_is_null(candidate_site) ? node : candidate_site;
     usage->site_start_byte = ts_node_start_byte(site);
     usage->site_end_byte = ts_node_end_byte(site);
@@ -1744,20 +2476,20 @@ static uint32_t active_lexical_scope_id(const WalkState *state) {
     if (!state) {
         return 0;
     }
-    for (int i = state->scope_top - 1; i >= 0; i--) {
-        if (state->scopes[i].lexical_scope_id != 0) {
-            return state->scopes[i].lexical_scope_id;
-        }
-    }
-    return state->root_lexical_scope_id;
+    uint32_t id = state->scope_top > 0
+                      ? state->scopes[state->scope_top - SKIP_ONE].active_lexical_scope_id
+                      : 0;
+    return id ? id : state->root_lexical_scope_id;
 }
 
 static uint32_t lexical_ancestor_of_kind(const WalkState *state, uint32_t start_id,
                                          bool want_function, bool want_block);
 
-static bool python_default_value_reference(TSNode node) {
+/* Carried down as CBM_USAGE_CONTEXT_PY_DEFAULT_VALUE. */
+static bool python_default_value_climb(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         const char *kind = ts_node_type(parent);
         /* A nested executable scope inside the default owns its own lookups;
          * only a direct default expression is evaluated in the declaring
@@ -1778,10 +2510,24 @@ static bool python_default_value_reference(TSNode node) {
     return false;
 }
 
-static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, const WalkState *state,
-                                                TSNode node) {
+static bool python_default_value_reference(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    const CBMUsageFrame *frame =
+        usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_PY_DEFAULT_VALUE);
+    if (!frame) {
+        return python_default_value_climb(node);
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_PY_DEFAULT_VALUE) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = python_default_value_climb(node);
+        usage_context_verify(ctx, state, node, "python_default_value", carried, climbed);
+    }
+    return carried;
+}
+
+static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
     uint32_t scope_id = active_lexical_scope_id(state);
-    if (!ctx || ctx->language != CBM_LANG_PYTHON || !python_default_value_reference(node)) {
+    if (!ctx || ctx->language != CBM_LANG_PYTHON ||
+        !python_default_value_reference(ctx, state, node)) {
         return scope_id;
     }
     uint32_t function_id = lexical_ancestor_of_kind(state, scope_id, true, false);
@@ -1859,6 +2605,7 @@ static bool ensure_lexical_binding_capacity(WalkState *state) {
 static bool lexical_ancestor_kind(TSNode node, const char *kind) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (strcmp(ts_node_type(parent), kind) == 0) {
             return true;
         }
@@ -1866,9 +2613,28 @@ static bool lexical_ancestor_kind(TSNode node, const char *kind) {
     return false;
 }
 
+/* Python `global` / `nonlocal` directive membership, carried down as
+ * CBM_USAGE_CONTEXT_IN_GLOBAL / _IN_NONLOCAL. */
+static bool python_directive_ancestor(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                      bool global) {
+    const char *kind = global ? "global_statement" : "nonlocal_statement";
+    uint32_t bit = global ? CBM_USAGE_CONTEXT_IN_GLOBAL : CBM_USAGE_CONTEXT_IN_NONLOCAL;
+    const CBMUsageFrame *frame = usage_carried_frame(state, node, false, bit);
+    if (!frame) {
+        return lexical_ancestor_kind(node, kind);
+    }
+    bool carried = (frame->context & bit) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = lexical_ancestor_kind(node, kind);
+        usage_context_verify(ctx, state, node, kind, carried, climbed);
+    }
+    return carried;
+}
+
 static TSNode declared_function_name_owner(TSNode node, const CBMLangSpec *spec) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (spec->function_node_types && cbm_kind_in_set(parent, spec->function_node_types)) {
             return field_contains_node(parent, "name", node) ? parent : (TSNode){0};
         }
@@ -1879,11 +2645,33 @@ static TSNode declared_function_name_owner(TSNode node, const CBMLangSpec *spec)
 static TSNode declared_class_name_owner(TSNode node, const CBMLangSpec *spec) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (spec->class_node_types && cbm_kind_in_set(parent, spec->class_node_types)) {
             return field_contains_node(parent, "name", node) ? parent : (TSNode){0};
         }
     }
     return (TSNode){0};
+}
+
+/* Is `node` the name its nearest function (or class) ancestor declares? The
+ * walk carries CBM_USAGE_CONTEXT_FUNCTION_NAME / _CLASS_NAME; the owner node
+ * itself is never needed, only whether there is one. */
+static bool declares_owner_name(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                const CBMLangSpec *spec, bool function) {
+    uint32_t bit = function ? CBM_USAGE_CONTEXT_FUNCTION_NAME : CBM_USAGE_CONTEXT_CLASS_NAME;
+    const CBMUsageFrame *frame = usage_carried_frame(state, node, false, bit);
+    if (!frame) {
+        return !ts_node_is_null(function ? declared_function_name_owner(node, spec)
+                                         : declared_class_name_owner(node, spec));
+    }
+    bool carried = (frame->context & bit) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = !ts_node_is_null(function ? declared_function_name_owner(node, spec)
+                                                 : declared_class_name_owner(node, spec));
+        usage_context_verify(ctx, state, node, function ? "function_name" : "class_name", carried,
+                             climbed);
+    }
+    return carried;
 }
 
 static bool ensure_python_directive_capacity(WalkState *state) {
@@ -1962,10 +2750,12 @@ static uint32_t python_enclosing_function_namespace(const WalkState *state,
     return 0;
 }
 
-static bool binding_is_parameter(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+/* Carried down as CBM_USAGE_CONTEXT_PARAMETER. */
+static bool binding_is_parameter_climb(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         const char *kind = ts_node_type(parent);
         if (kind_in_exact_set(kind, common_whole_binding_nodes) ||
             kind_in_exact_set(kind, occurrence->whole_binding_nodes)) {
@@ -1979,9 +2769,26 @@ static bool binding_is_parameter(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     return false;
 }
 
-static bool js_var_binding(TSNode node) {
+static bool binding_is_parameter(CBMExtractCtx *ctx, WalkState *state, TSNode node,
+                                 const CBMLangSpec *spec) {
+    const CBMUsageFrame *frame =
+        usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_PARAMETER);
+    if (!frame) {
+        return binding_is_parameter_climb(ctx, node, spec);
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_PARAMETER) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = binding_is_parameter_climb(ctx, node, spec);
+        usage_context_verify(ctx, state, node, "parameter", carried, climbed);
+    }
+    return carried;
+}
+
+/* Carried down as CBM_USAGE_CONTEXT_JS_VAR. */
+static bool js_var_binding_climb(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         const char *kind = ts_node_type(parent);
         if (strcmp(kind, "variable_declaration") == 0) {
             return true;
@@ -1993,6 +2800,19 @@ static bool js_var_binding(TSNode node) {
     return false;
 }
 
+static bool js_var_binding(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    const CBMUsageFrame *frame = usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_JS_VAR);
+    if (!frame) {
+        return js_var_binding_climb(node);
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_JS_VAR) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = js_var_binding_climb(node);
+        usage_context_verify(ctx, state, node, "js_var", carried, climbed);
+    }
+    return carried;
+}
+
 static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
     return (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types)) ||
            (spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types));
@@ -2001,6 +2821,7 @@ static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
 static TSNode nearest_import_ancestor(TSNode node, const CBMLangSpec *spec) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (import_kind_matches(parent, spec)) {
             return parent;
         }
@@ -2019,6 +2840,7 @@ static bool import_alias_contains(TSNode node, TSNode boundary) {
     for (TSNode parent = ts_node_parent(node);
          !ts_node_is_null(parent) && !ts_node_eq(parent, boundary);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (field_contains_node(parent, "alias", node)) {
             return true;
         }
@@ -2036,33 +2858,20 @@ static bool rust_use_list_has_direct_self(TSNode list) {
     return false;
 }
 
-/* Import subtrees are excluded from ordinary usage emission, but their local
- * names still participate in lexical lookup. Keep this classifier narrow: it
- * identifies only the binding side, never a module path or imported source
- * name. */
-static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    TSNode boundary = nearest_import_ancestor(node, spec);
-    if (ts_node_is_null(boundary)) {
-        return false;
-    }
-    /* Rust's extern-crate alias is a direct field of the import boundary,
-     * unlike the nested alias containers used by Python and ES imports. */
-    if (field_contains_node(boundary, "alias", node)) {
-        return true;
-    }
-    if (import_alias_contains(node, boundary)) {
-        return true;
-    }
-
+/* The rules below the import statement `boundary` once no alias field between
+ * them contains node. `ancestors` walks up from node. */
+static bool import_binding_below(CBMExtractCtx *ctx, TSNode node, TSNode boundary,
+                                 CBMUsageAncestors ancestors) {
     switch (ctx->language) {
     case CBM_LANG_PYTHON: {
         const char *boundary_kind = ts_node_type(boundary);
         if (strcmp(boundary_kind, "future_import_statement") == 0) {
             return false;
         }
-        for (TSNode parent = ts_node_parent(node);
+        CBMUsageAncestors scan = ancestors;
+        for (TSNode parent = usage_ancestors_next(&scan, node);
              !ts_node_is_null(parent) && !ts_node_eq(parent, boundary);
-             parent = ts_node_parent(parent)) {
+             parent = usage_ancestors_next(&scan, parent)) {
             /* In an aliased import, only the alias binds. */
             if (strcmp(ts_node_type(parent), "aliased_import") == 0) {
                 return false;
@@ -2084,10 +2893,11 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
         }
 
         TSNode entry = node;
-        TSNode parent = ts_node_parent(entry);
+        CBMUsageAncestors up = ancestors;
+        TSNode parent = usage_ancestors_next(&up, entry);
         while (!ts_node_is_null(parent) && !ts_node_eq(parent, boundary)) {
             entry = parent;
-            parent = ts_node_parent(parent);
+            parent = usage_ancestors_next(&up, parent);
         }
         TSNode first = first_named_leaf(entry);
         return !ts_node_is_null(first) && ts_node_eq(first, node);
@@ -2099,9 +2909,10 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
         if (strcmp(ts_node_type(boundary), "import_statement") != 0) {
             return false;
         }
-        for (TSNode parent = ts_node_parent(node);
+        CBMUsageAncestors scan = ancestors;
+        for (TSNode parent = usage_ancestors_next(&scan, node);
              !ts_node_is_null(parent) && !ts_node_eq(parent, boundary);
-             parent = ts_node_parent(parent)) {
+             parent = usage_ancestors_next(&scan, parent)) {
             const char *kind = ts_node_type(parent);
             if (strcmp(kind, "import_specifier") == 0) {
                 TSNode alias = ts_node_child_by_field_name(parent, TS_FIELD("alias"));
@@ -2138,9 +2949,10 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
             return false;
         }
         bool terminal = false;
-        for (TSNode parent = ts_node_parent(node);
+        CBMUsageAncestors scan = ancestors;
+        for (TSNode parent = usage_ancestors_next(&scan, node);
              !ts_node_is_null(parent) && !ts_node_eq(parent, boundary);
-             parent = ts_node_parent(parent)) {
+             parent = usage_ancestors_next(&scan, parent)) {
             if (field_contains_node(parent, "path", node)) {
                 /* `use foo::{self}` imports the module itself under the final
                  * segment of the prefix (`foo`). An aliased `self as x` is a
@@ -2169,6 +2981,46 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
     }
 }
 
+/* Every rule, climbing from node with ts_node_parent. */
+static bool import_binding_climb(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    TSNode boundary = nearest_import_ancestor(node, spec);
+    if (ts_node_is_null(boundary)) {
+        return false;
+    }
+    /* Rust's extern-crate alias is a direct field of the import boundary,
+     * unlike the nested alias containers used by Python and ES imports. */
+    if (field_contains_node(boundary, "alias", node) || import_alias_contains(node, boundary)) {
+        return true;
+    }
+    return import_binding_below(ctx, node, boundary, (CBMUsageAncestors){NULL, 0});
+}
+
+/* Import subtrees are excluded from ordinary usage emission, but their local
+ * names still participate in lexical lookup. Keep this classifier narrow: it
+ * identifies only the binding side, never a module path or imported source
+ * name. The walk keeps the import statement and the alias rule on its frames
+ * (CBM_USAGE_NEAREST_IMPORT, CBM_USAGE_CONTEXT_IMPORT_ALIAS); both climbed from
+ * every import identifier to the statement, so nested Rust use lists were
+ * cubic. The rules below the statement step the frames. */
+static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                         WalkState *state) {
+    const CBMUsageFrame *frame =
+        usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_IMPORT_ALIAS);
+    TSNode boundary;
+    uint32_t level;
+    if (!frame || !usage_nearest(state, node, CBM_USAGE_NEAREST_IMPORT, &boundary, &level)) {
+        return import_binding_climb(ctx, node, spec);
+    }
+    bool carried = !ts_node_is_null(boundary) &&
+                   ((frame->context & CBM_USAGE_CONTEXT_IMPORT_ALIAS) != 0 ||
+                    import_binding_below(ctx, node, boundary, usage_ancestors(state, node)));
+    if (usage_context_checking(state)) {
+        usage_context_verify(ctx, state, node, "import_binding", carried,
+                             import_binding_climb(ctx, node, spec));
+    }
+    return carried;
+}
+
 static uint32_t lexical_import_scope(const WalkState *state, uint32_t start_id) {
     uint32_t id = start_id;
     int remaining = state ? state->lexical_scope_count : 0;
@@ -2193,7 +3045,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     if (!ctx || !state || !raw_name || !raw_name[0] || state->lexical_binding_tracking_failed) {
         return;
     }
-    bool parameter = binding_is_parameter(ctx, node, spec);
+    bool parameter = binding_is_parameter(ctx, state, node, spec);
     if (ctx->language == CBM_LANG_VIMSCRIPT && parameter && !strchr(raw_name, ':')) {
         raw_name = cbm_arena_sprintf(ctx->arena, "a:%s", raw_name);
         if (!raw_name) {
@@ -2209,20 +3061,20 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     uint32_t current_id = active_lexical_scope_id(state);
     uint32_t scope_id = 0;
     bool whole_scope = false;
-    TSNode function_declaration = declared_function_name_owner(node, spec);
-    TSNode class_declaration = declared_class_name_owner(node, spec);
+    bool function_declaration = declares_owner_name(ctx, state, node, spec, true);
+    bool class_declaration = declares_owner_name(ctx, state, node, spec, false);
 
-    if (ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"))) {
+    if (ctx->language == CBM_LANG_PYTHON && (python_directive_ancestor(ctx, state, node, true) ||
+                                             python_directive_ancestor(ctx, state, node, false))) {
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
-        CBMPythonDirectiveKind directive = lexical_ancestor_kind(node, "global_statement")
+        CBMPythonDirectiveKind directive = python_directive_ancestor(ctx, state, node, true)
                                                ? CBM_PYTHON_DIRECTIVE_GLOBAL
                                                : CBM_PYTHON_DIRECTIVE_NONLOCAL;
         record_python_directive(state, function_id, name, directive);
         return;
     }
 
-    if (!ts_node_is_null(function_declaration)) {
+    if (function_declaration) {
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
         const CBMLexicalScope *function_scope = usage_lexical_scope(state, function_id);
         uint32_t parent_id = function_scope ? function_scope->parent_id : 0;
@@ -2243,7 +3095,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
             return;
         }
         whole_scope = true;
-    } else if (ctx->language == CBM_LANG_PYTHON && !ts_node_is_null(class_declaration)) {
+    } else if (ctx->language == CBM_LANG_PYTHON && class_declaration) {
         uint32_t class_id = python_nearest_namespace(state, current_id);
         const CBMLexicalScope *class_scope = usage_lexical_scope(state, class_id);
         scope_id = python_nearest_namespace(state, class_scope ? class_scope->parent_id : 0);
@@ -2283,7 +3135,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
                ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
-        bool is_var = js_var_binding(node);
+        bool is_var = js_var_binding(ctx, state, node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {
             scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
@@ -2460,12 +3312,11 @@ static char *perl_direct_coderef_name(CBMExtractCtx *ctx, TSNode node) {
     return end > start ? cbm_arena_strndup(ctx->arena, start, (size_t)(end - start)) : NULL;
 }
 
-static bool inside_direct_perl_coderef(CBMExtractCtx *ctx, TSNode node) {
-    if (!ctx || ctx->language != CBM_LANG_PERL) {
-        return false;
-    }
+/* Carried down as CBM_USAGE_CONTEXT_PERL_CODEREF. */
+static bool direct_perl_coderef_climb(TSNode node) {
     for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
+        usage_ancestor_step_test_note();
         if (strcmp(ts_node_type(parent), "refgen_expression") == 0) {
             return is_direct_argument_value(parent);
         }
@@ -2474,6 +3325,23 @@ static bool inside_direct_perl_coderef(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     return false;
+}
+
+static bool inside_direct_perl_coderef(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    if (!ctx || ctx->language != CBM_LANG_PERL) {
+        return false;
+    }
+    const CBMUsageFrame *frame =
+        usage_carried_frame(state, node, false, CBM_USAGE_CONTEXT_PERL_CODEREF);
+    if (!frame) {
+        return direct_perl_coderef_climb(node);
+    }
+    bool carried = (frame->context & CBM_USAGE_CONTEXT_PERL_CODEREF) != 0;
+    if (usage_context_checking(state)) {
+        bool climbed = direct_perl_coderef_climb(node);
+        usage_context_verify(ctx, state, node, "perl_coderef", carried, climbed);
+    }
+    return carried;
 }
 
 static bool emit_direct_perl_coderef_usage(CBMExtractCtx *ctx, TSNode node,
@@ -2501,10 +3369,10 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
     }
-    if (inside_direct_perl_coderef(ctx, node)) {
+    if (inside_direct_perl_coderef(ctx, NULL, node)) {
         return;
     }
-    if (!is_reference_node(node, ctx->language)) {
+    if (!is_reference_node(ctx, node, NULL)) {
         return;
     }
     if (is_call_argument_label(node)) {
@@ -2613,6 +3481,611 @@ void cbm_extract_usages(CBMExtractCtx *ctx) {
     walk_usages(ctx, ctx->root, spec);
 }
 
+/* ── Ancestor context carried by the unified walk ─────────────────────
+ *
+ * cbm_usage_context_enter runs for every node the walk visits. It computes the
+ * node's answers (CBM_USAGE_CONTEXT_*) from its parent's frame: the parent's
+ * own answers, the parent's role (resolved once, when its first child is
+ * entered), and the edge between them (the field the child occupies and, for
+ * the identity tests, the child itself). Each transition is one level of the
+ * matching climb above, in the same rule order, so an answer is decided by the
+ * same nearest ancestor that would have stopped the climb. */
+
+/* A parent's roles in those climbs. The kind roles depend only on the node's
+ * kind, so they are cached per walk by symbol; the others need the node. */
+enum {
+    CBM_USAGE_ROLE_RESOLVED = 1U << 0,
+    CBM_USAGE_ROLE_WHOLE_BINDING = 1U << 1,   /* common/language whole_binding_nodes */
+    CBM_USAGE_ROLE_DECLARING_KIND = 1U << 2,  /* field_binding_nodes, function/class/field */
+    CBM_USAGE_ROLE_VARIABLE_KIND = 1U << 3,   /* variable_node_types */
+    CBM_USAGE_ROLE_ASSIGNMENT_KIND = 1U << 4, /* assignment_node_types, write_nodes */
+    CBM_USAGE_ROLE_ELIXIR_OPERATOR = 1U << 5, /* binds by operator text instead of kind */
+    CBM_USAGE_ROLE_PLSQL_PARAMETER = 1U << 6, /* a call-argument wrapper, not a binder */
+    CBM_USAGE_ROLE_LINKER_ASSIGNMENT = 1U << 7,
+    CBM_USAGE_ROLE_LABELED_ARGUMENT = 1U << 8,
+    CBM_USAGE_ROLE_ARGUMENT_CONTAINER = 1U << 9,
+    CBM_USAGE_ROLE_FUNCTION = 1U << 10,
+    CBM_USAGE_ROLE_CLASS = 1U << 11,
+    CBM_USAGE_ROLE_PY_NESTED_SCOPE = 1U << 12, /* lambda or comprehension */
+    CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER = 1U << 13,
+    CBM_USAGE_ROLE_PY_GLOBAL = 1U << 14,
+    CBM_USAGE_ROLE_PY_NONLOCAL = 1U << 15,
+    CBM_USAGE_ROLE_JS_VAR_DECLARATION = 1U << 16,
+    CBM_USAGE_ROLE_JS_LEXICAL_DECLARATION = 1U << 17,
+    CBM_USAGE_ROLE_PERL_REFGEN = 1U << 18,
+    CBM_USAGE_ROLE_IMPORT_KIND = 1U << 19, /* import_kind_matches */
+    /* Per node. */
+    CBM_USAGE_ROLE_DECLARED = 1U << 20,           /* standard_binding_climb's declared_container */
+    CBM_USAGE_ROLE_ASSIGNMENT = 1U << 21,         /* write_climb's assignment */
+    CBM_USAGE_ROLE_READS_TARGET = 1U << 22,       /* assignment_reads_target */
+    CBM_USAGE_ROLE_PERL_DIRECT_REFGEN = 1U << 23, /* is_direct_argument_value */
+    CBM_USAGE_ROLE_IMPORT_SCOPE = 1U << 24,       /* an import or under one: alias is a target */
+    /* Where the climb for a CBM_USAGE_NEAREST_* slot stops. */
+    CBM_USAGE_ROLE_NEAREST_POLICY = 1U << 25,
+    CBM_USAGE_ROLE_NEAREST_POLICY_AUX = 1U << 26,
+    CBM_USAGE_ROLE_NEAREST_CALL_ROLE = 1U << 27,
+    CBM_USAGE_ROLE_NEAREST_IMPORT = 1U << 28,
+};
+
+static const uint32_t usage_nearest_role[CBM_USAGE_NEAREST_COUNT] = {
+    [CBM_USAGE_NEAREST_POLICY] = CBM_USAGE_ROLE_NEAREST_POLICY,
+    [CBM_USAGE_NEAREST_POLICY_AUX] = CBM_USAGE_ROLE_NEAREST_POLICY_AUX,
+    [CBM_USAGE_NEAREST_CALL_ROLE] = CBM_USAGE_ROLE_NEAREST_CALL_ROLE,
+    [CBM_USAGE_NEAREST_IMPORT] = CBM_USAGE_ROLE_NEAREST_IMPORT,
+};
+
+/* Initial frame and target-record capacities; both double as needed. */
+enum { USAGE_FRAMES_INITIAL = 64, USAGE_TARGETS_INITIAL = 16 };
+
+enum {
+    CBM_USAGE_FIELD_KNOWN = 1U << 0,
+    CBM_USAGE_FIELD_VALUE = 1U << 1, /* is_value_field */
+    CBM_USAGE_FIELD_TYPE = 1U << 2,
+    CBM_USAGE_FIELD_LABEL = 1U << 3, /* a labeled argument's name/label/key */
+};
+
+/* Field names of the CBM_USAGE_TARGET_* field slots, in slot order. The first
+ * nine are binding_fields, in its order. */
+static const char *const usage_target_field_names[] = {
+    "name",      "pattern", "declarator", "parameter",   "parameters", "left",    "variable",
+    "variables", "key",     "target",     "destination", "value",      "default", "alias",
+};
+_Static_assert(sizeof(usage_target_field_names) / sizeof(usage_target_field_names[0]) ==
+                   CBM_USAGE_FIELD_TARGET_COUNT,
+               "one field name per field target slot");
+
+/* Kind roles decided by the kind's name alone. The climbs they mirror are only
+ * asked in their own languages but do not check the language themselves, so
+ * neither do these; the three language-specific rules do. */
+static const struct {
+    CBMLanguage language; /* CBM_LANG_COUNT: any language */
+    const char *kind;
+    uint32_t role;
+} usage_named_kind_roles[] = {
+    {CBM_LANG_COUNT, "lambda", CBM_USAGE_ROLE_PY_NESTED_SCOPE},
+    {CBM_LANG_COUNT, "list_comprehension", CBM_USAGE_ROLE_PY_NESTED_SCOPE},
+    {CBM_LANG_COUNT, "set_comprehension", CBM_USAGE_ROLE_PY_NESTED_SCOPE},
+    {CBM_LANG_COUNT, "dictionary_comprehension", CBM_USAGE_ROLE_PY_NESTED_SCOPE},
+    {CBM_LANG_COUNT, "generator_expression", CBM_USAGE_ROLE_PY_NESTED_SCOPE},
+    {CBM_LANG_COUNT, "default_parameter", CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER},
+    {CBM_LANG_COUNT, "typed_default_parameter", CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER},
+    {CBM_LANG_COUNT, "global_statement", CBM_USAGE_ROLE_PY_GLOBAL},
+    {CBM_LANG_COUNT, "nonlocal_statement", CBM_USAGE_ROLE_PY_NONLOCAL},
+    {CBM_LANG_COUNT, "variable_declaration", CBM_USAGE_ROLE_JS_VAR_DECLARATION},
+    {CBM_LANG_COUNT, "lexical_declaration", CBM_USAGE_ROLE_JS_LEXICAL_DECLARATION},
+    {CBM_LANG_COUNT, "refgen_expression", CBM_USAGE_ROLE_PERL_REFGEN},
+    {CBM_LANG_ELIXIR, "binary_operator", CBM_USAGE_ROLE_ELIXIR_OPERATOR},
+    {CBM_LANG_PLSQL, "parameter", CBM_USAGE_ROLE_PLSQL_PARAMETER},
+    {CBM_LANG_LINKERSCRIPT, "assignment", CBM_USAGE_ROLE_LINKER_ASSIGNMENT},
+};
+
+/* Kind roles from the language spec's kind sets and the occurrence tables. */
+static uint32_t usage_spec_kind_roles(CBMExtractCtx *ctx, const CBMLangSpec *spec, TSNode node,
+                                      const char *kind) {
+    const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
+    bool function = spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types);
+    bool class_kind = spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types);
+    bool field = spec->field_node_types && cbm_kind_in_set(node, spec->field_node_types);
+    uint32_t roles = 0;
+    if (kind_in_exact_set(kind, common_whole_binding_nodes) ||
+        kind_in_exact_set(kind, occurrence->whole_binding_nodes)) {
+        roles |= CBM_USAGE_ROLE_WHOLE_BINDING;
+    }
+    if (kind_in_exact_set(kind, field_binding_nodes) || function || class_kind || field) {
+        roles |= CBM_USAGE_ROLE_DECLARING_KIND;
+    }
+    if (spec->variable_node_types && cbm_kind_in_set(node, spec->variable_node_types)) {
+        roles |= CBM_USAGE_ROLE_VARIABLE_KIND;
+    }
+    if ((spec->assignment_node_types && cbm_kind_in_set(node, spec->assignment_node_types)) ||
+        kind_in_exact_set(kind, occurrence->write_nodes)) {
+        roles |= CBM_USAGE_ROLE_ASSIGNMENT_KIND;
+    }
+    roles |= import_kind_matches(node, spec) ? CBM_USAGE_ROLE_IMPORT_KIND : 0U;
+    roles |= function ? CBM_USAGE_ROLE_FUNCTION : 0U;
+    roles |= class_kind ? CBM_USAGE_ROLE_CLASS : 0U;
+    return roles;
+}
+
+static uint32_t usage_kind_roles_uncached(CBMExtractCtx *ctx, const CBMLangSpec *spec,
+                                          TSNode node) {
+    const char *kind = ts_node_type(node);
+    uint32_t roles = CBM_USAGE_ROLE_RESOLVED | usage_spec_kind_roles(ctx, spec, node, kind);
+    roles |= is_labeled_argument_kind(kind) ? CBM_USAGE_ROLE_LABELED_ARGUMENT : 0U;
+    roles |= is_argument_container_kind(kind) ? CBM_USAGE_ROLE_ARGUMENT_CONTAINER : 0U;
+    for (size_t i = 0; i < sizeof(usage_named_kind_roles) / sizeof(usage_named_kind_roles[0]);
+         i++) {
+        CBMLanguage language = usage_named_kind_roles[i].language;
+        if ((language == CBM_LANG_COUNT || language == ctx->language) &&
+            strcmp(kind, usage_named_kind_roles[i].kind) == 0) {
+            roles |= usage_named_kind_roles[i].role;
+        }
+    }
+    return roles;
+}
+
+/* ts_node_type is a function of ts_node_symbol (the public symbol names the
+ * same kind) and cbm_kind_in_set tests the symbol, so kind roles cache by it. */
+static uint32_t usage_kind_roles(CBMExtractCtx *ctx, const CBMLangSpec *spec,
+                                 CBMUsageContext *context, TSNode node) {
+    TSSymbol symbol = ts_node_symbol(node);
+    if (symbol >= context->symbol_count) {
+        return usage_kind_roles_uncached(ctx, spec, node);
+    }
+    if (!context->symbol_roles[symbol]) {
+        context->symbol_roles[symbol] = usage_kind_roles_uncached(ctx, spec, node);
+    }
+    return context->symbol_roles[symbol];
+}
+
+static uint8_t usage_field_flags(CBMUsageContext *context, TSNode node, TSFieldId field_id) {
+    if (field_id == 0 || field_id > context->field_count) {
+        return 0;
+    }
+    uint8_t flags = context->field_flags[field_id];
+    if (flags) {
+        return flags;
+    }
+    const char *name = usage_field_name(node, field_id);
+    flags = CBM_USAGE_FIELD_KNOWN;
+    if (is_value_field(name)) {
+        flags |= CBM_USAGE_FIELD_VALUE;
+    }
+    if (name && strcmp(name, "type") == 0) {
+        flags |= CBM_USAGE_FIELD_TYPE;
+    }
+    if (name &&
+        (strcmp(name, "name") == 0 || strcmp(name, "label") == 0 || strcmp(name, "key") == 0)) {
+        flags |= CBM_USAGE_FIELD_LABEL;
+    }
+    context->field_flags[field_id] = flags;
+    return flags;
+}
+
+/* Record the field child in `slot`: as `id` when it is a direct child of
+ * `node`, else as `via`, the direct child above it. An empty target is left
+ * out: it cannot contain the non-empty nodes the frames answer for. */
+static void usage_resolve_field_target(CBMUsageTargets *targets, int slot, TSNode node,
+                                       TSFieldId field_id) {
+    TSNode target = ts_node_child_by_field_id(node, field_id);
+    if (ts_node_is_null(target) || ts_node_start_byte(target) == ts_node_end_byte(target)) {
+        return;
+    }
+    TSNode child = ts_node_child_with_descendant(node, target);
+    if (child.id == target.id) {
+        targets->id[slot] = target.id;
+    } else {
+        targets->via[slot] = child.id;
+    }
+}
+
+/* Resolve the children the transitions compare with, once for this parent.
+ * Records form a stack parallel to the path: a parent's record sits just above
+ * its ancestors' records, and a sibling subtree reuses the slots. */
+static bool usage_context_resolve_targets(CBMExtractCtx *ctx, CBMUsageContext *context,
+                                          CBMUsageFrame *parent) {
+    uint32_t index = parent->targets_end;
+    if (index >= context->target_capacity) {
+        uint32_t capacity =
+            context->target_capacity ? context->target_capacity * PAIR_LEN : USAGE_TARGETS_INITIAL;
+        CBMUsageTargets *grown = (CBMUsageTargets *)cbm_realloc(
+            CBM_MEM_CLASS_EXTRACT, context->targets, (size_t)capacity * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        context->targets = grown;
+        context->target_capacity = capacity;
+    }
+    if (!context->target_fields_resolved) {
+        const TSLanguage *language = ts_node_language(parent->node);
+        for (int i = 0; i < CBM_USAGE_FIELD_TARGET_COUNT; i++) {
+            const char *name = usage_target_field_names[i];
+            context->target_fields[i] =
+                ts_language_field_id_for_name(language, name, (uint32_t)strlen(name));
+        }
+        context->target_fields_resolved = true;
+    }
+    CBMUsageTargets *targets = &context->targets[index];
+    memset(targets, 0, sizeof(*targets));
+    TSNode node = parent->node;
+    uint32_t roles = parent->roles;
+    if (roles & CBM_USAGE_ROLE_DECLARED) {
+        for (int i = CBM_USAGE_TARGET_NAME; i <= CBM_USAGE_TARGET_KEY; i++) {
+            usage_resolve_field_target(targets, i, node, context->target_fields[i]);
+        }
+    }
+    if (roles & CBM_USAGE_ROLE_ASSIGNMENT) {
+        for (int i = CBM_USAGE_TARGET_TARGET; i <= CBM_USAGE_TARGET_DESTINATION; i++) {
+            usage_resolve_field_target(targets, i, node, context->target_fields[i]);
+        }
+        usage_resolve_field_target(targets, CBM_USAGE_TARGET_LEFT, node,
+                                   context->target_fields[CBM_USAGE_TARGET_LEFT]);
+        if (ts_node_child_count(node) > 0) {
+            targets->id[CBM_USAGE_TARGET_FIRST_CHILD] = ts_node_child(node, 0).id;
+        }
+        if (occurrence_specs[ctx->language].first_named_child_is_write &&
+            ts_node_named_child_count(node) > 0) {
+            targets->id[CBM_USAGE_TARGET_FIRST_NAMED_CHILD] = ts_node_named_child(node, 0).id;
+        }
+    }
+    if (roles & CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER) {
+        for (int i = CBM_USAGE_TARGET_VALUE; i <= CBM_USAGE_TARGET_DEFAULT; i++) {
+            usage_resolve_field_target(targets, i, node, context->target_fields[i]);
+        }
+    }
+    if (roles & CBM_USAGE_ROLE_IMPORT_SCOPE) {
+        usage_resolve_field_target(targets, CBM_USAGE_TARGET_ALIAS, node,
+                                   context->target_fields[CBM_USAGE_TARGET_ALIAS]);
+    }
+    parent->targets = index;
+    parent->targets_end = index + SKIP_ONE;
+    return true;
+}
+
+/* The CBM_USAGE_ROLE_NEAREST_* roles of node: the slots whose climbs stop at
+ * it. Text tests make some of these per node, so they are not kind roles. */
+static uint32_t usage_nearest_roles(CBMExtractCtx *ctx, const CBMUsageContext *context, TSNode node,
+                                    uint32_t roles) {
+    const bool *kept = context->nearest_kept;
+    uint32_t nearest = 0;
+    if (kept[CBM_USAGE_NEAREST_POLICY] && policy_ancestor_decides(ctx, node)) {
+        nearest |= CBM_USAGE_ROLE_NEAREST_POLICY;
+    }
+    if (kept[CBM_USAGE_NEAREST_POLICY_AUX] && policy_aux_ancestor_decides(ctx, node)) {
+        nearest |= CBM_USAGE_ROLE_NEAREST_POLICY_AUX;
+    }
+    if (kept[CBM_USAGE_NEAREST_CALL_ROLE] &&
+        cbm_call_role_ancestor_decides(ctx->language, node, ctx->source)) {
+        nearest |= CBM_USAGE_ROLE_NEAREST_CALL_ROLE;
+    }
+    if (roles & CBM_USAGE_ROLE_IMPORT_KIND) {
+        nearest |= CBM_USAGE_ROLE_NEAREST_IMPORT;
+    }
+    return nearest;
+}
+
+static bool usage_context_resolve_parent(CBMExtractCtx *ctx, const CBMLangSpec *spec,
+                                         CBMUsageContext *context, CBMUsageFrame *parent) {
+    TSNode node = parent->node;
+    uint32_t roles = usage_kind_roles(ctx, spec, context, node);
+    bool variable = (roles & CBM_USAGE_ROLE_VARIABLE_KIND) != 0;
+    bool assignment = (roles & CBM_USAGE_ROLE_ASSIGNMENT_KIND) != 0;
+    if (roles & CBM_USAGE_ROLE_ELIXIR_OPERATOR) {
+        /* The operator text replaces both kind tests, as in the climbs. */
+        variable = assignment = elixir_binary_operator_binds(ctx, node);
+    }
+    if (variable || (roles & CBM_USAGE_ROLE_DECLARING_KIND)) {
+        roles |= CBM_USAGE_ROLE_DECLARED;
+    }
+    if (assignment) {
+        roles |= CBM_USAGE_ROLE_ASSIGNMENT;
+        if (assignment_reads_target(node)) {
+            roles |= CBM_USAGE_ROLE_READS_TARGET;
+        }
+    }
+    if ((roles & CBM_USAGE_ROLE_PERL_REFGEN) && is_direct_argument_value(node)) {
+        roles |= CBM_USAGE_ROLE_PERL_DIRECT_REFGEN;
+    }
+    if ((roles & CBM_USAGE_ROLE_IMPORT_KIND) ||
+        parent->nearest[CBM_USAGE_NEAREST_IMPORT] != CBM_USAGE_NO_NEAREST) {
+        roles |= CBM_USAGE_ROLE_IMPORT_SCOPE;
+    }
+    roles |= usage_nearest_roles(ctx, context, node, roles);
+    parent->roles = roles;
+    if (!(roles & (CBM_USAGE_ROLE_DECLARED | CBM_USAGE_ROLE_ASSIGNMENT |
+                   CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER | CBM_USAGE_ROLE_IMPORT_SCOPE))) {
+        return true;
+    }
+    return usage_context_resolve_targets(ctx, context, parent);
+}
+
+static bool usage_slots_hold(const void *const *slots, const void *id, int first, int last) {
+    for (int i = first; i <= last; i++) {
+        if (slots[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* One level of each climb, for the edge from `parent` (roles, its answers
+ * `inherited`) into a child with edge-field flags `field` and node id `id`.
+ * `id` is compared where the climb tests containment (see usage_carried_frame
+ * for why that is the same test). */
+typedef struct {
+    uint32_t roles;
+    uint32_t inherited;
+    uint8_t field;
+    const CBMUsageTargets *targets;
+    const void *id;
+} CBMUsageEdge;
+
+/* The parent's answer and its unknown bit, when this level does not decide. */
+static uint32_t usage_inherit(const CBMUsageEdge *edge, uint32_t answer) {
+    return edge->inherited & (answer | usage_unknown(answer));
+}
+
+/* A containment test at this level: yes when the child is one of the targets
+ * in [first, last], unknown when the child lies above one of them, and
+ * `otherwise` when it is neither. */
+static uint32_t usage_contains(const CBMUsageEdge *edge, uint32_t answer, int first, int last,
+                               uint32_t otherwise) {
+    if (usage_slots_hold(edge->targets->id, edge->id, first, last)) {
+        return answer;
+    }
+    if (usage_slots_hold(edge->targets->via, edge->id, first, last)) {
+        return usage_unknown(answer);
+    }
+    return otherwise;
+}
+
+/* standard_binding_climb */
+static uint32_t usage_carry_binding(const CBMUsageEdge *edge) {
+    const uint32_t answer = CBM_USAGE_CONTEXT_BINDING;
+    if (edge->field & (CBM_USAGE_FIELD_VALUE | CBM_USAGE_FIELD_TYPE)) {
+        return 0;
+    }
+    if (edge->roles & CBM_USAGE_ROLE_PLSQL_PARAMETER) {
+        return usage_inherit(edge, answer); /* transparent */
+    }
+    if (edge->roles & CBM_USAGE_ROLE_WHOLE_BINDING) {
+        return answer;
+    }
+    if (edge->roles & CBM_USAGE_ROLE_DECLARED) {
+        return usage_contains(edge, answer, CBM_USAGE_TARGET_NAME, CBM_USAGE_TARGET_KEY,
+                              usage_inherit(edge, answer));
+    }
+    return usage_inherit(edge, answer);
+}
+
+/* write_climb */
+static uint32_t usage_carry_write(const CBMUsageEdge *edge) {
+    const uint32_t answer = CBM_USAGE_CONTEXT_WRITE;
+    if (edge->field & CBM_USAGE_FIELD_VALUE) {
+        return 0;
+    }
+    if (!(edge->roles & CBM_USAGE_ROLE_ASSIGNMENT)) {
+        return usage_inherit(edge, answer);
+    }
+    if (edge->roles & CBM_USAGE_ROLE_READS_TARGET) {
+        return 0;
+    }
+    if (edge->roles & CBM_USAGE_ROLE_LINKER_ASSIGNMENT) {
+        return usage_contains(edge, answer, CBM_USAGE_TARGET_FIRST_CHILD,
+                              CBM_USAGE_TARGET_FIRST_CHILD, 0);
+    }
+    uint32_t named_first = usage_contains(edge, answer, CBM_USAGE_TARGET_FIRST_NAMED_CHILD,
+                                          CBM_USAGE_TARGET_FIRST_NAMED_CHILD, 0);
+    uint32_t target = usage_contains(edge, answer, CBM_USAGE_TARGET_TARGET,
+                                     CBM_USAGE_TARGET_DESTINATION, named_first);
+    return usage_contains(edge, answer, CBM_USAGE_TARGET_LEFT, CBM_USAGE_TARGET_LEFT, target);
+}
+
+/* python_default_value_climb: a lambda or comprehension stops it with no; a
+ * default parameter answers yes for the child in its value or default field
+ * and lets any other child keep climbing. */
+static uint32_t usage_carry_python_default(const CBMUsageEdge *edge) {
+    const uint32_t answer = CBM_USAGE_CONTEXT_PY_DEFAULT_VALUE;
+    if (edge->roles & CBM_USAGE_ROLE_PY_NESTED_SCOPE) {
+        return 0;
+    }
+    if (edge->roles & CBM_USAGE_ROLE_PY_DEFAULT_PARAMETER) {
+        return usage_contains(edge, answer, CBM_USAGE_TARGET_VALUE, CBM_USAGE_TARGET_DEFAULT,
+                              usage_inherit(edge, answer));
+    }
+    return usage_inherit(edge, answer);
+}
+
+/* binding_is_parameter_climb */
+static uint32_t usage_carry_parameter(const CBMUsageEdge *edge) {
+    const uint32_t answer = CBM_USAGE_CONTEXT_PARAMETER;
+    if (edge->roles & CBM_USAGE_ROLE_WHOLE_BINDING) {
+        return answer;
+    }
+    if (edge->roles & CBM_USAGE_ROLE_FUNCTION) {
+        return usage_contains(edge, answer, CBM_USAGE_TARGET_PARAMETER, CBM_USAGE_TARGET_PARAMETERS,
+                              0);
+    }
+    return usage_inherit(edge, answer);
+}
+
+/* declared_function_name_owner / declared_class_name_owner: the nearest
+ * `owner` ancestor decides by its name field. */
+static uint32_t usage_carry_owner_name(const CBMUsageEdge *edge, uint32_t owner, uint32_t answer) {
+    if (edge->roles & owner) {
+        return usage_contains(edge, answer, CBM_USAGE_TARGET_NAME, CBM_USAGE_TARGET_NAME, 0);
+    }
+    return usage_inherit(edge, answer);
+}
+
+/* A climb with no containment test that stops at the nearest `decides`
+ * ancestor with `verdict`, or at the nearest `refuses` ancestor with no. */
+static uint32_t usage_carry_nearest(const CBMUsageEdge *edge, uint32_t answer, uint32_t decides,
+                                    bool verdict, uint32_t refuses) {
+    if (edge->roles & decides) {
+        return verdict ? answer : 0U;
+    }
+    if (edge->roles & refuses) {
+        return 0;
+    }
+    return edge->inherited & answer;
+}
+
+/* lexical_ancestor_kind: ANY ancestor of the kind, not the nearest decider. */
+static uint32_t usage_carry_any(const CBMUsageEdge *edge, uint32_t answer, uint32_t kind) {
+    return (edge->roles & kind) ? answer : (edge->inherited & answer);
+}
+
+/* import_binding_climb's alias rule: an alias field at any level from the
+ * nearest import statement down contains the node. An import restarts it. */
+static uint32_t usage_carry_import_alias(const CBMUsageEdge *edge) {
+    const uint32_t answer = CBM_USAGE_CONTEXT_IMPORT_ALIAS;
+    if (!(edge->roles & CBM_USAGE_ROLE_IMPORT_SCOPE)) {
+        return 0;
+    }
+    uint32_t above = (edge->roles & CBM_USAGE_ROLE_IMPORT_KIND) ? 0U : usage_inherit(edge, answer);
+    return above | usage_contains(edge, answer, CBM_USAGE_TARGET_ALIAS, CBM_USAGE_TARGET_ALIAS, 0);
+}
+
+static uint32_t usage_context_carry(CBMUsageContext *context, const CBMUsageFrame *parent,
+                                    TSFieldId field_id, TSNode child) {
+    static const CBMUsageTargets no_targets = {{0}, {0}};
+    CBMUsageEdge edge = {
+        .roles = parent->roles,
+        .inherited = parent->context,
+        .field = usage_field_flags(context, child, field_id),
+        .targets = parent->targets == CBM_USAGE_NO_TARGETS ? &no_targets
+                                                           : &context->targets[parent->targets],
+        .id = child.id,
+    };
+    const CBMUsageEdge *e = &edge;
+    return usage_carry_binding(e) | usage_carry_write(e) | usage_carry_python_default(e) |
+           usage_carry_parameter(e) |
+           usage_carry_owner_name(e, CBM_USAGE_ROLE_FUNCTION, CBM_USAGE_CONTEXT_FUNCTION_NAME) |
+           usage_carry_owner_name(e, CBM_USAGE_ROLE_CLASS, CBM_USAGE_CONTEXT_CLASS_NAME) |
+           /* call_argument_label_climb */
+           usage_carry_nearest(e, CBM_USAGE_CONTEXT_ARGUMENT_LABEL, CBM_USAGE_ROLE_LABELED_ARGUMENT,
+                               (e->field & CBM_USAGE_FIELD_LABEL) != 0,
+                               CBM_USAGE_ROLE_ARGUMENT_CONTAINER) |
+           /* js_var_binding_climb */
+           usage_carry_nearest(e, CBM_USAGE_CONTEXT_JS_VAR, CBM_USAGE_ROLE_JS_VAR_DECLARATION, true,
+                               CBM_USAGE_ROLE_JS_LEXICAL_DECLARATION) |
+           /* direct_perl_coderef_climb */
+           usage_carry_nearest(e, CBM_USAGE_CONTEXT_PERL_CODEREF, CBM_USAGE_ROLE_PERL_REFGEN,
+                               (e->roles & CBM_USAGE_ROLE_PERL_DIRECT_REFGEN) != 0,
+                               CBM_USAGE_ROLE_ARGUMENT_CONTAINER) |
+           usage_carry_any(e, CBM_USAGE_CONTEXT_IN_GLOBAL, CBM_USAGE_ROLE_PY_GLOBAL) |
+           usage_carry_any(e, CBM_USAGE_CONTEXT_IN_NONLOCAL, CBM_USAGE_ROLE_PY_NONLOCAL) |
+           usage_carry_import_alias(e);
+}
+
+void cbm_usage_context_init(CBMExtractCtx *ctx, const CBMLangSpec *spec, WalkState *state) {
+    CBMUsageContext *context = &state->usage_context;
+    memset(context, 0, sizeof(*context));
+    CBMOccurrencePolicy policy = occurrence_specs[ctx->language].policy;
+    context->nearest_kept[CBM_USAGE_NEAREST_POLICY] = policy_uses_nearest(policy);
+    context->nearest_kept[CBM_USAGE_NEAREST_POLICY_AUX] =
+        policy == CBM_OCCURRENCE_TLAPLUS_OPERATOR || policy == CBM_OCCURRENCE_NICKEL_LET;
+    context->nearest_kept[CBM_USAGE_NEAREST_CALL_ROLE] = cbm_call_role_language(ctx->language);
+    context->nearest_kept[CBM_USAGE_NEAREST_IMPORT] =
+        (spec->import_node_types && spec->import_node_types[0]) ||
+        (spec->import_from_types && spec->import_from_types[0]);
+    const TSLanguage *language = ts_node_language(ctx->root);
+    context->symbol_count = ts_language_symbol_count(language);
+    context->field_count = ts_language_field_count(language);
+    context->symbol_roles = (uint32_t *)cbm_calloc(
+        CBM_MEM_CLASS_EXTRACT, (size_t)context->symbol_count * sizeof(*context->symbol_roles));
+    context->field_flags =
+        (uint8_t *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)context->field_count + SKIP_ONE);
+    context->failed = !context->symbol_roles || !context->field_flags;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *check = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check && check[0] && strcmp(check, "0") != 0) {
+        context->check_mode = strcmp(check, "2") == 0 ? USAGE_CHECK_ABORT : USAGE_CHECK_REPORT;
+    }
+    const char *climb = getenv("CBM_TEST_USAGE_CONTEXT_CLIMB");
+    context->climb_only = climb && strcmp(climb, "1") == 0;
+#endif
+}
+
+void cbm_usage_context_enter(CBMExtractCtx *ctx, const CBMLangSpec *spec, WalkState *state,
+                             uint32_t depth, TSNode node, TSFieldId field_id) {
+    CBMUsageContext *context = &state->usage_context;
+    if (context->failed) {
+        return;
+    }
+    if (depth >= context->frame_capacity) {
+        uint32_t capacity =
+            context->frame_capacity ? context->frame_capacity : USAGE_FRAMES_INITIAL;
+        while (capacity <= depth) {
+            capacity *= PAIR_LEN;
+        }
+        CBMUsageFrame *grown = (CBMUsageFrame *)cbm_realloc(CBM_MEM_CLASS_EXTRACT, context->frames,
+                                                            (size_t)capacity * sizeof(*grown));
+        if (!grown) {
+            context->failed = true;
+            return;
+        }
+        context->frames = grown;
+        context->frame_capacity = capacity;
+    }
+    CBMUsageFrame *frame = &context->frames[depth];
+    frame->node = node;
+    frame->field_id = field_id;
+    frame->roles = 0;
+    frame->targets = CBM_USAGE_NO_TARGETS;
+    context->depth = depth;
+    if (depth == 0) {
+        /* The root has no ancestors, so every climb from it answers no. */
+        frame->targets_end = 0;
+        frame->context = 0;
+        for (int slot = 0; slot < CBM_USAGE_NEAREST_COUNT; slot++) {
+            frame->nearest[slot] = CBM_USAGE_NO_NEAREST;
+        }
+        return;
+    }
+    CBMUsageFrame *parent = &context->frames[depth - SKIP_ONE];
+    if (!(parent->roles & CBM_USAGE_ROLE_RESOLVED) &&
+        !usage_context_resolve_parent(ctx, spec, context, parent)) {
+        context->failed = true;
+        return;
+    }
+    frame->targets_end = parent->targets_end;
+    frame->context = usage_context_carry(context, parent, field_id, node);
+    for (int slot = 0; slot < CBM_USAGE_NEAREST_COUNT; slot++) {
+        frame->nearest[slot] =
+            (parent->roles & usage_nearest_role[slot]) ? depth - SKIP_ONE : parent->nearest[slot];
+    }
+}
+
+void cbm_usage_context_free(CBMExtractCtx *ctx, WalkState *state) {
+    CBMUsageContext *context = &state->usage_context;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (context->check_mode) {
+        char checks[24];
+        char fallbacks[24];
+        char mismatches[24];
+        snprintf(checks, sizeof(checks), "%llu", (unsigned long long)context->checks);
+        snprintf(fallbacks, sizeof(fallbacks), "%llu", (unsigned long long)context->fallbacks);
+        snprintf(mismatches, sizeof(mismatches), "%llu", (unsigned long long)context->mismatches);
+        /* Quiet unless something climbed anyway or disagreed. */
+        CBMLogLevel level = context->fallbacks || context->mismatches || context->failed
+                                ? CBM_LOG_INFO
+                                : CBM_LOG_DEBUG;
+        cbm_log(level, "usage_context.summary", "path", ctx->rel_path ? ctx->rel_path : "",
+                "checks", checks, "fallbacks", fallbacks, "mismatches", mismatches, "failed",
+                context->failed ? "1" : "0", NULL);
+    }
+#else
+    (void)ctx;
+#endif
+    cbm_free(CBM_MEM_CLASS_EXTRACT, context->frames);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, context->targets);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, context->symbol_roles);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, context->field_flags);
+    memset(context, 0, sizeof(*context));
+}
+
 // --- Unified handler: called once per node by the cursor walk ---
 // Uses WalkState flags instead of parent-chain walks for O(1) context checks.
 
@@ -2621,15 +4094,15 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
                                        active_lexical_scope_id(state))) {
         return;
     }
-    if (inside_direct_perl_coderef(ctx, node)) {
+    if (inside_direct_perl_coderef(ctx, state, node)) {
         return;
     }
-    bool reference_node = is_reference_node(node, ctx->language);
+    bool reference_node = is_reference_node(ctx, node, state);
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     bool possible_binding_leaf =
         ts_node_is_named(node) && ts_node_named_child_count(node) == 0 &&
         (state->inside_import || is_exact_language_binding(ctx, node, state) ||
-         is_policy_binding(ctx, node, occurrence));
+         is_policy_binding(ctx, node, occurrence, state));
     if (!reference_node && !possible_binding_leaf) {
         return;
     }
@@ -2666,16 +4139,16 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         }
         return;
     }
-    if (is_forward_sibling_callee(ctx->language, node)) {
+    if (is_forward_sibling_callee(ctx, state, node)) {
         return;
     }
-    if (is_call_argument_label_walk(node, state)) {
+    if (is_call_argument_label_walk(ctx, node, state)) {
         return;
     }
     // Imports do not emit ordinary usages, but their binding occurrence must
     // be recorded before the subtree is skipped.
     if (state->inside_import) {
-        if (is_import_binding_occurrence(ctx, node, spec)) {
+        if (is_import_binding_occurrence(ctx, node, spec, state)) {
             char *binding_name = reference_name(ctx, node);
             if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
                 record_lexical_binding(ctx, state, node, spec, binding_name, true);
@@ -2685,8 +4158,8 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     bool python_scope_directive =
-        ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"));
+        ctx->language == CBM_LANG_PYTHON && (python_directive_ancestor(ctx, state, node, true) ||
+                                             python_directive_ancestor(ctx, state, node, false));
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
         char *binding_name = reference_name(ctx, node);
         if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {

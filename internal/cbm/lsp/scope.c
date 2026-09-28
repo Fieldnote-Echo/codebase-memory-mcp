@@ -1,5 +1,24 @@
 #include "scope.h"
+#include <stdint.h>
 #include <string.h>
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local uint64_t g_scope_test_name_compares;
+
+void cbm_scope_test_reset(void) {
+    g_scope_test_name_compares = 0;
+}
+
+uint64_t cbm_scope_test_name_compares(void) {
+    return g_scope_test_name_compares;
+}
+
+static void scope_test_note_compare(void) {
+    g_scope_test_name_compares++;
+}
+#else
+static void scope_test_note_compare(void) {}
+#endif
 
 CBMScope* cbm_scope_push(CBMArena* a, CBMScope* current) {
     CBMScope* scope = (CBMScope*)cbm_arena_alloc(a, sizeof(CBMScope));
@@ -33,6 +52,96 @@ static CBMScopeChunk* alloc_chunk(CBMScope* scope) {
     return c;
 }
 
+static bool binding_named(const CBMVarBinding *binding, const char *name) {
+    scope_test_note_compare();
+    return binding->name && strcmp(binding->name, name) == 0;
+}
+
+enum {
+    SCOPE_INDEX_SPREAD = 2, /* slots per binding at least: the index stays half empty */
+    SCOPE_INDEX_GROWTH = 2,
+    SCOPE_INDEX_FAILED = -1, /* index_cap after a failed allocation: scan this frame */
+};
+#define SCOPE_PROBE_STEP 1U
+#define SCOPE_FNV_OFFSET 2166136261U
+#define SCOPE_FNV_PRIME 16777619U
+
+static uint32_t scope_name_hash(const char *name) {
+    uint32_t hash = SCOPE_FNV_OFFSET; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        hash = (hash ^ *p) * SCOPE_FNV_PRIME;
+    }
+    return hash;
+}
+
+/* The index is an open-addressing table of pointers into the frame's chunks,
+ * kept at most half full, so every probe sequence reaches an empty slot. */
+static void scope_index_put(CBMVarBinding **index, int cap, CBMVarBinding *binding) {
+    uint32_t mask = (uint32_t)cap - SCOPE_PROBE_STEP;
+    uint32_t slot = scope_name_hash(binding->name) & mask;
+    while (index[slot]) {
+        slot = (slot + SCOPE_PROBE_STEP) & mask;
+    }
+    index[slot] = binding;
+}
+
+static void scope_index_rebuild(CBMScope *scope) {
+    int cap = SCOPE_INDEX_SPREAD * CBM_SCOPE_INDEX_MIN_BINDINGS;
+    while (cap < SCOPE_INDEX_SPREAD * scope->binding_count) {
+        cap *= SCOPE_INDEX_GROWTH;
+    }
+    CBMVarBinding **index =
+        (CBMVarBinding **)cbm_arena_alloc(scope->arena, (size_t)cap * sizeof(CBMVarBinding *));
+    if (!index) {
+        scope->index = NULL;
+        scope->index_cap = SCOPE_INDEX_FAILED;
+        return;
+    }
+    memset(index, 0, (size_t)cap * sizeof(CBMVarBinding *));
+    for (CBMScopeChunk *c = scope->chunks; c != NULL; c = c->next) {
+        for (int i = 0; i < c->used; i++) {
+            scope_index_put(index, cap, &c->bindings[i]);
+        }
+    }
+    scope->index = index;
+    scope->index_cap = cap;
+}
+
+/* A binding was just appended to the frame. */
+static void scope_index_note(CBMScope *scope, CBMVarBinding *binding) {
+    if (scope->index_cap == SCOPE_INDEX_FAILED ||
+        scope->binding_count <= CBM_SCOPE_INDEX_MIN_BINDINGS) {
+        return;
+    }
+    if (!scope->index || SCOPE_INDEX_SPREAD * scope->binding_count > scope->index_cap) {
+        scope_index_rebuild(scope);
+        return;
+    }
+    scope_index_put(scope->index, scope->index_cap, binding);
+}
+
+/* The frame's binding for name (names are unique within a frame), or NULL. */
+static CBMVarBinding *scope_find_local(const CBMScope *scope, const char *name) {
+    if (scope->index) {
+        uint32_t mask = (uint32_t)scope->index_cap - SCOPE_PROBE_STEP;
+        for (uint32_t slot = scope_name_hash(name) & mask; scope->index[slot];
+             slot = (slot + SCOPE_PROBE_STEP) & mask) {
+            if (binding_named(scope->index[slot], name)) {
+                return scope->index[slot];
+            }
+        }
+        return NULL;
+    }
+    for (CBMScopeChunk *c = scope->chunks; c != NULL; c = c->next) {
+        for (int i = 0; i < c->used; i++) {
+            if (binding_named(&c->bindings[i], name)) {
+                return &c->bindings[i];
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Returns false when the binding could NOT be recorded in THIS frame.
  *
  * The failure that matters is arena exhaustion in alloc_chunk: the old void
@@ -47,14 +156,11 @@ static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMTyp
     if (!scope || !name) {
         return false;
     }
-    for (CBMScopeChunk* c = scope->chunks; c != NULL; c = c->next) {
-        for (int i = 0; i < c->used; i++) {
-            if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                c->bindings[i].type = type;
-                c->bindings[i].callable_qn = callable_qn;
-                return true;
-            }
-        }
+    CBMVarBinding *existing = scope_find_local(scope, name);
+    if (existing) {
+        existing->type = type;
+        existing->callable_qn = callable_qn;
+        return true;
     }
     CBMScopeChunk* head = scope->chunks;
     if (!head || head->used >= CBM_SCOPE_CHUNK_BINDINGS) {
@@ -63,10 +169,13 @@ static bool cbm_scope_bind_value(CBMScope *scope, const char *name, const CBMTyp
             return false; /* arena exhausted: the shadow did NOT take effect */
         }
     }
-    head->bindings[head->used].name = name;
-    head->bindings[head->used].type = type;
-    head->bindings[head->used].callable_qn = callable_qn;
+    CBMVarBinding *binding = &head->bindings[head->used];
+    binding->name = name;
+    binding->type = type;
+    binding->callable_qn = callable_qn;
     head->used++;
+    scope->binding_count++;
+    scope_index_note(scope, binding);
     return true;
 }
 
@@ -93,12 +202,9 @@ const CBMType* cbm_scope_lookup(const CBMScope* scope, const char* name) {
         return cbm_type_unknown();
     }
     for (const CBMScope* s = scope; s != NULL; s = s->parent) {
-        for (CBMScopeChunk* c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                    return c->bindings[i].type;
-                }
-            }
+        const CBMVarBinding *binding = scope_find_local(s, name);
+        if (binding) {
+            return binding->type;
         }
     }
     return cbm_type_unknown();
@@ -109,12 +215,8 @@ bool cbm_scope_contains(const CBMScope *scope, const char *name) {
         return false;
     }
     for (const CBMScope *s = scope; s != NULL; s = s->parent) {
-        for (const CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                    return true;
-                }
-            }
+        if (scope_find_local(s, name)) {
+            return true;
         }
     }
     return false;
@@ -125,12 +227,9 @@ const char *cbm_scope_lookup_callable(const CBMScope *scope, const char *name) {
         return NULL;
     }
     for (const CBMScope *s = scope; s != NULL; s = s->parent) {
-        for (const CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                    return c->bindings[i].callable_qn;
-                }
-            }
+        const CBMVarBinding *binding = scope_find_local(s, name);
+        if (binding) {
+            return binding->callable_qn;
         }
     }
     return NULL;
@@ -141,13 +240,10 @@ bool cbm_scope_update_callable(CBMScope *scope, const char *name, const char *ca
         return false;
     }
     for (CBMScope *s = scope; s != NULL; s = s->parent) {
-        for (CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                    c->bindings[i].callable_qn = callable_qn;
-                    return true;
-                }
-            }
+        CBMVarBinding *binding = scope_find_local(s, name);
+        if (binding) {
+            binding->callable_qn = callable_qn;
+            return true;
         }
     }
     return false;

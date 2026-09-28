@@ -127,6 +127,24 @@ static char *rust_node_text(RustLSPContext *ctx, TSNode node) {
     return cbm_node_text(ctx->arena, node, ctx->source);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local uint64_t g_rust_lsp_test_evals;
+
+void cbm_rust_lsp_test_eval_reset(void) {
+    g_rust_lsp_test_evals = 0;
+}
+
+uint64_t cbm_rust_lsp_test_evals(void) {
+    return g_rust_lsp_test_evals;
+}
+
+static void rust_lsp_test_note_eval(void) {
+    g_rust_lsp_test_evals++;
+}
+#else
+static void rust_lsp_test_note_eval(void) {}
+#endif
+
 /* ════════════════════════════════════════════════════════════════════
  * 2. Builtin / prelude tables
  * ════════════════════════════════════════════════════════════════════ */
@@ -1457,6 +1475,7 @@ static const CBMType *rust_eval_member_access(RustLSPContext *ctx, const CBMType
                                               const char *member);
 
 const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
+    rust_lsp_test_note_eval();
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
     }
@@ -4631,6 +4650,12 @@ static void rust_resolve_call_expression(RustLSPContext *ctx, TSNode node) {
  * for control-flow constructs that bind variables. */
 #define CBM_RUST_EVAL_STEP_CAP 200000 /* per-file budget */
 static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
+    /* This node's type, when the level above evaluated it (binop_left). */
+    const CBMType *node_type = NULL;
+    if (ctx->binop_left_type && ts_node_eq(node, ctx->binop_left)) {
+        node_type = ctx->binop_left_type;
+    }
+    ctx->binop_left_type = NULL;
     if (ts_node_is_null(node))
         return;
     /* Pathological-input guard: bail out once we've spent too many
@@ -4714,7 +4739,14 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                 char *op = rust_node_text(ctx, c);
                 const char *method = rust_binop_trait_method(op);
                 if (method) {
-                    rust_emit_operator_call(ctx, rust_eval_expr_type(ctx, left), method, node);
+                    /* An arithmetic node's type is its left operand's, so a
+                     * type handed down for this node is the left operand's. */
+                    const CBMType *left_type =
+                        node_type ? node_type : rust_eval_expr_type(ctx, left);
+                    rust_emit_operator_call(ctx, left_type, method, node);
+                    /* `left` is the next node entered: the first child. */
+                    ctx->binop_left = left;
+                    ctx->binop_left_type = left_type;
                 }
                 break; /* operator is the sole anonymous child */
             }

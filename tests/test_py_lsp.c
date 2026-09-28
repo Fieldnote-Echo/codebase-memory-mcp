@@ -12,6 +12,9 @@
 #include "lsp/py_lsp.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "../src/foundation/compat.h" /* cbm_setenv (import index cross-check) */
+#include "graph_buffer/graph_buffer.h"
+#include "lsp/scope.h"
 
 /* ── Helpers — same shape as test_go_lsp.c ──────────────────────── */
 
@@ -2157,9 +2160,216 @@ TEST(pylsp_eval_steps_budget_degrades_gracefully) {
     PASS();
 }
 
+/* Classifying an import binding (from-import member, aliased or unaliased
+ * module import) matches its local name against the items of the file's
+ * top-level import statements, and replaying each statement matches each of
+ * its items against the import bindings. Done pairwise, one statement
+ * importing n names cost O(n^2) item comparisons, twice per file (the file's
+ * own resolver and the cross-file pass). Count the items examined, a
+ * deterministic work counter. */
+static uint64_t pylsp_wide_import_items(int names) {
+    size_t capacity = (size_t)names * 16U + 64U;
+    char *src = malloc(capacity);
+    if (!src)
+        return UINT64_MAX;
+    size_t used = (size_t)snprintf(src, capacity, "from m import (");
+    for (int i = 0; i < names; i++)
+        used += (size_t)snprintf(src + used, capacity - used, "%sa%d", i ? ", " : "", i);
+    snprintf(src + used, capacity - used, ")\nx = a0\n");
+    char check[8] = "";
+    const char *check_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check_env) {
+        snprintf(check, sizeof(check), "%s", check_env);
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    cbm_py_lsp_test_import_reset();
+    CBMFileResult *r = extract_py(src);
+    uint64_t items = cbm_py_lsp_test_import_items();
+    if (check_env)
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", check, 1);
+    free(src);
+    if (!r)
+        return UINT64_MAX;
+    cbm_free_result(r);
+    return items;
+}
+
+TEST(pylsp_wide_import_statement_matches_linearly) {
+    enum { SMALL = 256, BIG = 2048, INPUT_GROWTH = 8, ITEM_RATIO_MAX = 12 };
+    uint64_t small = pylsp_wide_import_items(SMALL);
+    uint64_t big = pylsp_wide_import_items(BIG);
+    fprintf(stderr, "  [py-wide-import] items(%d)=%llu items(%d)=%llu\n", SMALL,
+            (unsigned long long)small, BIG, (unsigned long long)big);
+    ASSERT_NEQ(small, UINT64_MAX);
+    ASSERT_NEQ(big, UINT64_MAX);
+    /* Anti-vacuous: every binding really was classified and replayed. */
+    ASSERT_GTE(small, (uint64_t)SMALL);
+    if (big > small * ITEM_RATIO_MAX + 256U) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "import items examined grew from %llu to %llu for %dx input (maximum %dx + 256)",
+                 (unsigned long long)small, (unsigned long long)big, INPUT_GROWTH, ITEM_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* With CBM_TEST_USAGE_CONTEXT_CHECK set, every import classification answered
+ * from the index is also answered item by item, and a disagreement is
+ * counted. Cover each way an item matches: from-import members plain and
+ * aliased, relative modules, module paths and their dotted prefixes, module
+ * aliases, a name bound twice (ambiguous), a wildcard, an import below the
+ * top level, and malformed statements. */
+TEST(pylsp_import_index_matches_item_by_item) {
+    static const char *const sources[] = {
+        "from pkg.mod import f, g as h, (k)\nfrom . import sib\nfrom ..up import far as near\n"
+        "import a.b.c\nimport a.b as ab, d\nimport e.f.g as g2\n"
+        "f(); h(); k(); sib(); near(); a.b.c.x(); ab.y(); d.z(); g2.w()\n",
+        "from m import dup\nfrom n import dup\nimport dup\nimport x.dup\nfrom o import *\n"
+        "if cond:\n    import hidden\n    from p import inner\ndup(); hidden(); inner()\n",
+        "import a.b.c, a.b\nimport a\nfrom a import b\nfrom a.b import c as a\na.b.c()\n",
+        "from m import (a0, a1,\n    a2 as a3, a4)\nimport q.r as a0\na0(); a3(); a4()\n",
+        "from m import\nimport \nfrom . import (x,\nimport y as\ny()\n",
+    };
+    char previous[8] = "";
+    const char *previous_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (previous_env)
+        snprintf(previous, sizeof(previous), "%s", previous_env);
+    cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", "1", 1);
+    cbm_py_lsp_test_import_reset();
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMFileResult *r = extract_py(sources[i]);
+        if (r)
+            cbm_free_result(r);
+    }
+    if (previous_env)
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", previous, 1);
+    else
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    uint64_t checks = cbm_py_lsp_test_import_checks();
+    uint64_t mismatches = cbm_py_lsp_test_import_mismatches();
+    fprintf(stderr, "  [py-import-index] checks=%llu mismatches=%llu\n", (unsigned long long)checks,
+            (unsigned long long)mismatches);
+    ASSERT_GTE(checks, 30);
+    ASSERT_EQ(mismatches, 0);
+    PASS();
+}
+
+/* One statement importing n names also made two quadratic scans:
+ *   - the lexical scope compared each new binding, and each lookup, with every
+ *     binding already in the frame (cbm_scope_*);
+ *   - the cross-file import map (cbm_pxc_build_import_map, which the usages
+ *     pass builds too) looked each name up by scanning all of the file's
+ *     imports and every key already in the map.
+ * Count the names and rows compared, deterministic work counters. */
+typedef struct {
+    uint64_t scope_compares;
+    uint64_t map_steps;
+    int map_count;
+} PyWideImportWork;
+
+static bool py_wide_import_work(int names, PyWideImportWork *out) {
+    size_t capacity = (size_t)names * 16U + 64U;
+    char *src = malloc(capacity);
+    if (!src)
+        return false;
+    size_t used = (size_t)snprintf(src, capacity, "from m import (");
+    for (int i = 0; i < names; i++)
+        used += (size_t)snprintf(src + used, capacity - used, "%sa%d", i ? ", " : "", i);
+    snprintf(src + used, capacity - used, ")\nx = a0\n");
+    char check[8] = "";
+    const char *check_env = getenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    if (check_env) {
+        snprintf(check, sizeof(check), "%s", check_env);
+        cbm_unsetenv("CBM_TEST_USAGE_CONTEXT_CHECK");
+    }
+    cbm_scope_test_reset();
+    CBMFileResult *r = extract_py(src);
+    out->scope_compares = cbm_scope_test_name_compares();
+    if (check_env)
+        cbm_setenv("CBM_TEST_USAGE_CONTEXT_CHECK", check, 1);
+    free(src);
+    if (!r)
+        return false;
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/");
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int count = 0;
+    cbm_pxc_test_import_scan_reset();
+    cbm_pxc_build_import_map(gbuf, "test", "main.py", CBM_LANG_PYTHON, r, &keys, &vals, &count);
+    out->map_steps = cbm_pxc_test_import_scan_steps();
+    out->map_count = count;
+    cbm_pxc_free_import_map(keys, vals, count);
+    cbm_gbuf_free(gbuf);
+    cbm_free_result(r);
+    return true;
+}
+
+TEST(pylsp_wide_import_scope_and_import_map_are_linear) {
+    enum { SMALL = 256, BIG = 2048, INPUT_GROWTH = 8, RATIO_MAX = 12 };
+    PyWideImportWork small = {0};
+    PyWideImportWork big = {0};
+    ASSERT_TRUE(py_wide_import_work(SMALL, &small));
+    ASSERT_TRUE(py_wide_import_work(BIG, &big));
+    fprintf(stderr,
+            "  [py-wide-import] scope_compares(%d)=%llu scope_compares(%d)=%llu "
+            "map_steps(%d)=%llu map_steps(%d)=%llu\n",
+            SMALL, (unsigned long long)small.scope_compares, BIG,
+            (unsigned long long)big.scope_compares, SMALL, (unsigned long long)small.map_steps, BIG,
+            (unsigned long long)big.map_steps);
+    /* Anti-vacuous: every name was bound and mapped. */
+    ASSERT_EQ(small.map_count, SMALL);
+    ASSERT_EQ(big.map_count, BIG);
+    ASSERT_GTE(small.scope_compares, (uint64_t)SMALL);
+    ASSERT_GTE(small.map_steps, (uint64_t)SMALL);
+    char message[192] = "";
+    if (big.scope_compares > small.scope_compares * RATIO_MAX + 256U) {
+        snprintf(message, sizeof(message),
+                 "scope name compares grew from %llu to %llu for %dx input (maximum %dx + 256)",
+                 (unsigned long long)small.scope_compares, (unsigned long long)big.scope_compares,
+                 INPUT_GROWTH, RATIO_MAX);
+    } else if (big.map_steps > small.map_steps * RATIO_MAX + 256U) {
+        snprintf(message, sizeof(message),
+                 "import map steps grew from %llu to %llu for %dx input (maximum %dx + 256)",
+                 (unsigned long long)small.map_steps, (unsigned long long)big.map_steps,
+                 INPUT_GROWTH, RATIO_MAX);
+    }
+    if (message[0])
+        FAIL(message);
+    PASS();
+}
+
+/* The import map keeps one key per local name that one import path binds
+ * unambiguously: a name two paths bind is dropped (fail-closed), a name
+ * imported twice from one path is kept once, and an alias whose leaf differs
+ * from its name has no metadata QN. */
+TEST(pylsp_import_map_keeps_unique_unambiguous_names) {
+    CBMFileResult *r = extract_py("from m import (a, b)\nfrom n import a\nfrom m import b\n"
+                                  "from p import c as d\nfrom q import e\n");
+    ASSERT_NOT_NULL(r);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("test", "/");
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int count = 0;
+    cbm_pxc_build_import_map(gbuf, "test", "main.py", CBM_LANG_PYTHON, r, &keys, &vals, &count);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(keys[0], "b");
+    ASSERT_STR_EQ(vals[0], "test.m.b");
+    ASSERT_STR_EQ(keys[1], "e");
+    ASSERT_STR_EQ(vals[1], "test.q.e");
+    cbm_pxc_free_import_map(keys, vals, count);
+    cbm_gbuf_free(gbuf);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_wide_import_statement_matches_linearly);
+    RUN_TEST(pylsp_import_index_matches_item_by_item);
+    RUN_TEST(pylsp_wide_import_scope_and_import_map_are_linear);
+    RUN_TEST(pylsp_import_map_keeps_unique_unambiguous_names);
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
     RUN_TEST(pylsp_smoke_one_function);

@@ -56,6 +56,7 @@ typedef struct {
     const char **import_module_qns;
     unsigned char *import_kinds; // internal PyDirectImportKind, classified once from the AST
     int import_count;
+    int import_capacity; // entries the three arrays have room for, besides the NULL terminators
 
     // Current function/class context for resolving `self`/`cls` and emitting
     // caller QNs.
@@ -196,5 +197,16 @@ typedef struct {
 
 void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
                             CBMResolvedCallArray *out);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam, per calling thread: import items and import
+ * bindings examined while matching import local names (a deterministic work
+ * counter), and, under CBM_TEST_USAGE_CONTEXT_CHECK, import classifications
+ * cross-checked against the item-by-item match and the disagreements. */
+void cbm_py_lsp_test_import_reset(void);
+uint64_t cbm_py_lsp_test_import_items(void);
+uint64_t cbm_py_lsp_test_import_checks(void);
+uint64_t cbm_py_lsp_test_import_mismatches(void);
+#endif
 
 #endif // CBM_LSP_PY_LSP_H

@@ -24,10 +24,18 @@ typedef struct CBMScopeChunk {
     struct CBMScopeChunk* next;
 } CBMScopeChunk;
 
+/* A frame past this many bindings gets a name index (an open-addressing table
+ * of binding pointers in the frame's arena): a module that imports thousands
+ * of names bound and looked each one up by scanning the whole frame. */
+#define CBM_SCOPE_INDEX_MIN_BINDINGS 32
+
 typedef struct CBMScope {
     struct CBMScope* parent;
     CBMScopeChunk* chunks;
     CBMArena* arena;        // owning arena, propagated to children at push time
+    int binding_count;      // bindings in this frame (names are unique per frame)
+    int index_cap;          // slots in index (a power of two); -1: indexing failed
+    CBMVarBinding** index;  // NULL until binding_count passes CBM_SCOPE_INDEX_MIN_BINDINGS
 } CBMScope;
 
 // Bail-to-UNKNOWN depth for type-lookup chains: alias resolution, MRO walks,
@@ -91,5 +99,12 @@ const char *cbm_scope_lookup_callable(const CBMScope *scope, const char *name);
  * lexical binding. Returns false when name is unbound. This is for assignment;
  * declarations should continue to use cbm_scope_bind[_callable]. */
 bool cbm_scope_update_callable(CBMScope *scope, const char *name, const char *callable_qn);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam, per calling thread: binding names compared by
+ * the scope operations. */
+void cbm_scope_test_reset(void);
+uint64_t cbm_scope_test_name_compares(void);
+#endif
 
 #endif // CBM_LSP_SCOPE_H

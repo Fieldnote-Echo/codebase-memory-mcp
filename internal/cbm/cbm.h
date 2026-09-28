@@ -240,9 +240,22 @@ typedef struct {
     const char *impl_trait;
 } CBMDefinition;
 
-/* Argument captured from a call expression */
+/* Argument captured from a call expression.
+ *
+ * expr is the argument's raw source text, except that a composite argument
+ * (a call, a lambda, a collection...) longer than CBM_CALL_ARG_EXPR_PREFIX
+ * bytes keeps only its first CBM_CALL_ARG_EXPR_PREFIX bytes: in f(f(f(x)))
+ * each argument holds every inner one, and whole copies cost quadratic arena
+ * bytes. The resolve passes read at most 256 bytes of such an expr (the args
+ * JSON escapes into 256 bytes, sanitize_expr keeps 120). String and
+ * identifier arguments, texts that open with '/' or '`' (the URL and route
+ * detectors read those whole), and every argument of a call with a
+ * '/'-led argument (the route handler lookup) keep their whole text; see
+ * call_arg_expr in extract_calls.c. */
+#define CBM_CALL_ARG_EXPR_PREFIX 512
+
 typedef struct {
-    const char *expr;    // raw expression text ("payload.info", "MY_URL", "'hello'")
+    const char *expr;    // raw expression text ("payload.info", "MY_URL", "'hello'"); see above
     const char *value;   // resolved string value or NULL (constant propagation)
     const char *keyword; // keyword name if keyword arg ("url", "topic_id"), NULL if positional
     int index;           // positional index (0-based)
@@ -855,6 +868,20 @@ uint64_t cbm_kotlin_operator_dedup_test_comparisons(void);
 void cbm_usage_field_lookup_test_reset(void);
 uint64_t cbm_usage_field_lookup_test_work(void);
 uint64_t cbm_usage_slow_parent_fallback_test_count(void);
+// Steps toward the root taken by an occurrence classifier (any mechanism), and
+// walk-cursor stack entries copied to start such a climb. Reset with the above.
+uint64_t cbm_usage_ancestor_step_test_count(void);
+uint64_t cbm_usage_cursor_copy_test_entries(void);
+#endif
+
+#if defined(CBM_ENABLE_TEST_SEAMS)
+// Cross-check of the ancestor context the unified walk carries for the usage
+// classifiers (CBM_TEST_USAGE_CONTEXT_CHECK=1|2): carried answers compared with
+// the climbing reference, disagreements, and answers that had to climb anyway.
+void cbm_usage_context_test_reset(void);
+uint64_t cbm_usage_context_test_checks(void);
+uint64_t cbm_usage_context_test_mismatches(void);
+uint64_t cbm_usage_context_test_fallbacks(void);
 #endif
 
 // Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables

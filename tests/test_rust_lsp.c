@@ -6764,6 +6764,79 @@ TEST(rustlsp_followup_b_pathological_no_hang) {
     cbm_free_result(r); PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* `a + a + ... + a` is a left-deep spine of binary_expressions. Operator
+ * desugaring needs the type of every left operand, and the type of an
+ * arithmetic `x + y` is the type of `x`, so evaluating it at each level of the
+ * spine walked the whole spine below again: O(n^2) evaluations for n terms,
+ * paid once per file and again in the cross-file pass. Count evaluations,
+ * which is deterministic, and check the types still come out right: every `+`
+ * of the user type resolves to its `add`. */
+static bool rustlsp_operator_chain_work(int terms, uint64_t *evals, int *adds) {
+    static const char prefix[] = "use std::ops::Add;\n"
+                                 "pub struct P;\n"
+                                 "impl Add for P {\n"
+                                 "    type Output = P;\n"
+                                 "    fn add(self, other: P) -> P { other }\n"
+                                 "}\n"
+                                 "pub fn chain(a: P) -> P { ";
+    static const char term[] = "a + ";
+    static const char suffix[] = "a }\n";
+    size_t capacity = sizeof(prefix) + (size_t)terms * (sizeof(term) - 1U) + sizeof(suffix);
+    char *src = malloc(capacity);
+    if (!src) {
+        return false;
+    }
+    size_t offset = 0;
+    memcpy(src + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 1; i < terms; i++) {
+        memcpy(src + offset, term, sizeof(term) - 1U);
+        offset += sizeof(term) - 1U;
+    }
+    memcpy(src + offset, suffix, sizeof(suffix));
+    cbm_rust_lsp_test_eval_reset();
+    CBMFileResult *r = extract_rust(src);
+    *evals = cbm_rust_lsp_test_evals();
+    free(src);
+    if (!r) {
+        return false;
+    }
+    *adds = count_resolved(r, "chain", "add");
+    cbm_free_result(r);
+    return true;
+}
+
+TEST(rustlsp_operator_chain_evaluates_each_operand_once) {
+    enum { SMALL = 64, BIG = 512, INPUT_GROWTH = 8, EVAL_RATIO_MAX = 12 };
+    uint64_t small_evals = 0;
+    uint64_t big_evals = 0;
+    int small_adds = 0;
+    int big_adds = 0;
+    ASSERT_TRUE(rustlsp_operator_chain_work(SMALL, &small_evals, &small_adds));
+    ASSERT_TRUE(rustlsp_operator_chain_work(BIG, &big_evals, &big_adds));
+    fprintf(stderr, "  [rust-operator-chain] evals(%d)=%llu evals(%d)=%llu adds=%d/%d\n", SMALL,
+            (unsigned long long)small_evals, BIG, (unsigned long long)big_evals, small_adds,
+            big_adds);
+    /* One `add` per operator: the left operand's type is still P everywhere,
+     * and each operator's left operand really was evaluated. */
+    ASSERT_EQ(small_adds, SMALL - 1);
+    ASSERT_EQ(big_adds, BIG - 1);
+    ASSERT_GTE(small_evals, (uint64_t)(SMALL - 1));
+    uint64_t maximum = small_evals * EVAL_RATIO_MAX + 256U;
+    if (big_evals > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "operator chain evaluations grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- the spine is re-evaluated per operator",
+                 (unsigned long long)small_evals, (unsigned long long)big_evals, INPUT_GROWTH,
+                 EVAL_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+#endif
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -7382,4 +7455,7 @@ void suite_rust_lsp(void) {
 
     /* FOLLOWUP B: eval-step hardening */
     RUN_TEST(rustlsp_followup_b_pathological_no_hang);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(rustlsp_operator_chain_evaluates_each_operand_once);
+#endif
 }
